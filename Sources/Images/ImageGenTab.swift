@@ -1342,8 +1342,8 @@ struct ImageInstanceForm: View {
                 }.labelsHidden().frame(width: 96)
             }
             row(loc.t("Modo rápido", "Fast mode"),
-                loc.t("Reutiliza pasos del muestreo en vez de recalcularlos. Más rápido, pero cambia el detalle de la imagen. En Qwen-Image 2.1: cache-dit 1.13x, spectrum 1.45x, easycache 1.69x.",
-                      "Reuses sampling steps instead of computing them again. Faster, but it changes the image's detail. On Qwen-Image 2.1: cache-dit 1.13x, spectrum 1.45x, easycache 1.69x.")) {
+                loc.t("Reutiliza pasos del muestreo en vez de recalcularlos. Más rápido, pero cambia el detalle de la imagen. En Qwen-Image 2.1 a 25 pasos, aproximadamente: cache-dit 1.46x, spectrum 1.91x, easycache 2.06x.",
+                      "Reuses sampling steps instead of computing them again. Faster, but it changes the image's detail. On Qwen-Image 2.1 at 25 steps, roughly: cache-dit 1.46x, spectrum 1.91x, easycache 2.06x.")) {
                 Picker("", selection: $cfg.fastMode) {
                     ForEach(ImageFastMode.allCases.filter { $0.supports(model) }) { mode in
                         Text(fastModeLabel(mode)).tag(mode.rawValue)
@@ -1411,14 +1411,14 @@ struct ImageInstanceForm: View {
             return loc.t("Calcula todos los pasos: la imagen de referencia.",
                          "Computes every step: the reference image.")
         case .cacheDit:
-            return loc.t("El más fiel al original y el que menos acelera (1.13x en Qwen-Image 2.1).",
-                         "Closest to the original and the smallest speedup (1.13x on Qwen-Image 2.1).")
+            return loc.t("El que menos acelera (alrededor de 1.46x en Qwen-Image 2.1).",
+                         "The smallest speedup (about 1.46x on Qwen-Image 2.1).")
         case .spectrum:
-            return loc.t("Equilibrio: 1.45x en Qwen-Image 2.1, misma composición con cambios de detalle.",
-                         "Balanced: 1.45x on Qwen-Image 2.1, same composition with changes in detail.")
+            return loc.t("Equilibrio: alrededor de 1.91x en Qwen-Image 2.1, misma composición con cambios de detalle.",
+                         "Balanced: about 1.91x on Qwen-Image 2.1, same composition with changes in detail.")
         case .easycache:
-            return loc.t("El más rápido (1.69x en Qwen-Image 2.1), con pérdida visible de nitidez.",
-                         "The fastest (1.69x on Qwen-Image 2.1), with visible loss of sharpness.")
+            return loc.t("El más rápido (alrededor de 2.06x en Qwen-Image 2.1), con la imagen algo más suave.",
+                         "The fastest (about 2.06x on Qwen-Image 2.1), with a slightly softer image.")
         }
     }
 

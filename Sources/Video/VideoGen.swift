@@ -118,7 +118,8 @@ enum VideoGenCatalog {
         sizes: [VideoGenSize(width: 1280, height: 704), VideoGenSize(width: 704, height: 1280)],
         fps: 24,
         nativeFrames: 121, supportsI2V: true, recommendable: false,
-        extraArgs: ["--vae-conv-direct", "--vae-tile-size", "16",
+        // tile size in image pixels: 256 is the 16-latent tile of this x16 VAE
+        extraArgs: ["--vae-conv-direct", "--vae-tile-size", "256",
                     "--scheduler", "smoothstep"],
         negativePrompt: defaultNegative,
         samplingWorkspaceBaseMB: 64,

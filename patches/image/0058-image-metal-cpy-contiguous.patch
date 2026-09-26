@@ -1,0 +1,219 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index d1daac6..71a8c6e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -75,21 +75,21 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+     }
+ 
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst, bool contig) {
+     char base[256];
+     char name[256];
+ 
+-    snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
++    snprintf(base, 256, "kernel_cpy_%s%s_%s", contig ? "contig_" : "", ggml_type_name(tsrc), ggml_type_name(tdst));
+     snprintf(name, 256, "%s", base);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+     }
+ 
+     return res;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 1b65294..42d13c5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -103,17 +103,17 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
+ void ggml_metal_library_free(ggml_metal_library_t lib);
+ 
+ ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst, bool contig);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index d5fdcfa..f45bf0b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -681,17 +681,17 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
+     const bool inplace = (bool) ((const int32_t *) op->op_params)[4];
+ 
+     if (!inplace) {
+         // run a separate kernel to cpy src->dst
+         // not sure how to avoid this
+         // TODO: make a simpler cpy_bytes kernel
+ 
+         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
+-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
++        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
+ 
+         ggml_metal_kargs_cpy args = {
+             /*.nk0  =*/ ne00,
+             /*.ne00 =*/ ne00,
+             /*.ne01 =*/ ne01,
+             /*.ne02 =*/ ne02,
+             /*.ne03 =*/ ne03,
+             /*.nb00 =*/ nb00,
+@@ -1994,17 +1994,17 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
+     const bool inplace = (bool) ((const int32_t *) op->op_params)[4];
+ 
+     if (!inplace) {
+         // run a separate kernel to cpy src->dst
+         // not sure how to avoid this
+         // TODO: make a simpler cpy_bytes kernel
+ 
+         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
+-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
++        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
+ 
+         ggml_metal_kargs_cpy args = {
+             /*.nk0  =*/ ne00,
+             /*.ne00 =*/ ne00,
+             /*.ne01 =*/ ne01,
+             /*.ne02 =*/ ne02,
+             /*.ne03 =*/ ne03,
+             /*.nb00 =*/ nb00,
+@@ -2028,17 +2028,17 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
+ 
+         const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00);
+ 
+         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+ 
+         ggml_metal_op_concurrency_reset(ctx);
+     }
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type);
++    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type, false);
+ 
+     GGML_ASSERT(ne10 % ggml_blck_size(op->src[1]->type) == 0);
+ 
+     int64_t nk0 = ne10;
+     if (ggml_is_quantized(op->src[1]->type)) {
+         nk0 = ne10/16;
+     } else if (ggml_is_quantized(op->type)) {
+         nk0 = ne10/ggml_blck_size(op->type);
+@@ -2103,17 +2103,48 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
++    // a fully contiguous copy is one flat range: the generic kernel spends its instructions
++    // recomputing 4-D indices for every element instead
++    const bool contig = ggml_blck_size(op->src[0]->type) == 1 && ggml_blck_size(op->type) == 1 &&
++                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
++                        getenv("TOSH_CPY_CONTIG_DISABLE") == nullptr;
++
++    if (contig) {
++        const int64_t n = ggml_nelements(op);
++
++        ggml_metal_kargs_cpy args_contig = {
++            /*.nk0  =*/ n,
++            /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02, /*.ne03 =*/ ne03,
++            /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
++            /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1,  /*.ne2  =*/ ne2,  /*.ne3  =*/ ne3,
++            /*.nb0  =*/ nb0,  /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
++        };
++
++        auto pipeline_contig = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, true);
++
++        const int nth_contig = std::min<int>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_contig));
++
++        ggml_metal_encoder_set_pipeline(enc, pipeline_contig);
++        ggml_metal_encoder_set_bytes   (enc, &args_contig, sizeof(args_contig), 0);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth_contig - 1)/nth_contig, 1, 1, nth_contig, 1, 1);
++
++        return 1;
++    }
++
++    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
+ 
+     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
+ 
+     int64_t nk0 = ne00;
+     if (ggml_is_quantized(op->src[0]->type)) {
+         nk0 = ne00/16;
+     } else if (ggml_is_quantized(op->type)) {
+         nk0 = ne00/ggml_blck_size(op->type);
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index c709135..7b5b90c 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9129,18 +9129,52 @@ kernel void kernel_cpy_t_t(
+ 
+     for (int32_t i00 = iw0*ntg[0] + tpitg.x; i00 < args.ne00;) {
+         device const T0 * src = (device T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
+         dst_data[i00] = cpy_cast<T1>(src[0]);
+         break;
+     }
+ }
+ 
++// same copy with both sides contiguous: the general kernel spends ~900 integer instructions
++// per element rebuilding the 4D index, which this one does not need. nk0 is the element count
++template<typename T0, typename T1>
++kernel void kernel_cpy_contig_t_t(
++        constant ggml_metal_kargs_cpy & args,
++        device  const char * src0,
++        device        char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    const int64_t i = (int64_t) tgpig[0]*ntg[0] + tpitg.x;
++
++    if (i >= args.nk0) {
++        return;
++    }
++
++    ((device T1 *) dst)[i] = cpy_cast<T1>(((device const T0 *) src0)[i]);
++}
++
+ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
+ 
++template [[host_name("kernel_cpy_contig_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   float>;
++template [[host_name("kernel_cpy_contig_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   half>;
++template [[host_name("kernel_cpy_contig_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   int32_t>;
++template [[host_name("kernel_cpy_contig_i32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<int32_t, float>;
++template [[host_name("kernel_cpy_contig_i32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<int32_t, int32_t>;
++#if defined(GGML_METAL_HAS_BF16)
++template [[host_name("kernel_cpy_contig_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   bfloat>;
++#endif
++template [[host_name("kernel_cpy_contig_f16_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<half,    float>;
++template [[host_name("kernel_cpy_contig_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<half,    half>;
++#if defined(GGML_METAL_HAS_BF16)
++template [[host_name("kernel_cpy_contig_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_contig_t_t<bfloat,  float>;
++template [[host_name("kernel_cpy_contig_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_contig_t_t<bfloat,  bfloat>;
++#endif
++
+ template [[host_name("kernel_cpy_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   float>;
+ template [[host_name("kernel_cpy_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   half>;
+ template [[host_name("kernel_cpy_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   int32_t>;
+ template [[host_name("kernel_cpy_i32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<int32_t, float>;
+ template [[host_name("kernel_cpy_i32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_t<int32_t, int32_t>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_cpy_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_t_t<float,   bfloat>;
+ #endif

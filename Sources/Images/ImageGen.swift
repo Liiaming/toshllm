@@ -326,7 +326,8 @@ enum ImageGenCatalog {
             maxLongEdge: 2048, displayMaxLongEdge: 1920, nativeLongEdge: 2048,
             halfPartials: true,
             maxReferenceImages: 16,
-            extraArgs: ["--sampling-method", "euler", "--scheduler", "simple"])
+            // 384 px VAE tiles: 256 pays per tile and 512 grows the mid-block attention faster than it saves.
+            extraArgs: ["--sampling-method", "euler", "--scheduler", "simple", "--vae-tile-size", "384"])
     }
 
     static let qwenImage21Q3 = qwenImage21(
@@ -558,9 +559,9 @@ enum ImageFormat: String, CaseIterable, Identifiable {
 }
 
 /// Step caching in the sampler: a cached step reuses the previous output instead of running
-/// the model. Faster, at the cost of detail. Measured on Qwen-Image 2.1 at 1024x1024 and ten
-/// steps against no cache: cache-dit 1.13x (PSNR 31.4 dB), spectrum 1.45x (30.6 dB),
-/// easycache 1.69x (28.5 dB).
+/// the model. Faster, at the cost of detail. Measured on Qwen-Image 2.1 at 1024x1024 and 25
+/// steps against no cache: cache-dit 1.46x (PSNR 30.6 dB), spectrum 1.91x (30.6 dB),
+/// easycache 2.06x (31.6 dB).
 enum ImageFastMode: String, CaseIterable, Identifiable {
     case off, cacheDit = "cache-dit", spectrum, easycache
     var id: String { rawValue }

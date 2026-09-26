@@ -13,7 +13,7 @@ ROOT="$PWD"
 
 LLAMA_COMMIT="${LLAMA_COMMIT:-9575389609d6f8437de0b205561a4824d217c409}"   # llama.cpp commit validated against the patches
 WHISPER_COMMIT="${WHISPER_COMMIT:-371b5a7561823ab2bb32142d2751e35e7534727b}" # whisper.cpp v1.9.3
-SD_COMMIT="${SD_COMMIT:-6dcb5bb}"         # stable-diffusion.cpp commit validated for image gen
+SD_COMMIT="${SD_COMMIT:-2f88688}"         # stable-diffusion.cpp commit validated for image gen
 ARCH="${ARCH:-$(uname -m)}"
 DEPLOYMENT_TARGET="14.0"        # same floor as the app (Package.swift)
 if [ "$ARCH" = "universal" ]; then
@@ -345,6 +345,19 @@ build_image_engine() {
     # Half partials as an opt-in: float stays the default because some models overflow half,
     # and the app sets TOSH_MM_ACC_HALF only for the models checked with it.
     git apply --include='ggml/src/ggml-metal/*' -p1 "$ROOT/patches/image/0056-image-metal-half-partials.patch"
+    # Qwen-Image 2.1 runs its fused gate/up projection through one SwiGLU instead of copying
+    # both halves out first; TOSH_QWEN21_SWIGLU_DISABLE restores the split graph.
+    git apply -p1 "$ROOT/patches/image/0057-image-qwen21-fused-swiglu.patch"
+    # A fully contiguous copy runs as one flat range instead of rebuilding a 4-D index per
+    # element; same port as the speech engine's 0028.
+    git apply --include='ggml/src/ggml-metal/*' -p1 "$ROOT/patches/image/0058-image-metal-cpy-contiguous.patch"
+    # Qwen-Image 2.1 rotates q and k straight from its cos/sin table in one kernel, with a CPU
+    # twin for the fallback; TOSH_QWEN21_ROPE_TABLE_DISABLE restores the generic graph.
+    git apply -p1 "$ROOT/patches/image/0059-image-qwen21-rope-table.patch"
+    # The cached prefix and the new keys meet in F16, the type flash attention reads.
+    git apply -p1 "$ROOT/patches/image/0060-image-qwen21-prefix-f16.patch"
+    # The down projection takes its input in F16, which its tile loader rounds to anyway.
+    git apply -p1 "$ROOT/patches/image/0061-image-qwen21-down-f16.patch"
     echo "applied ggml-metal hunks of 0001 + 0003 + core fallback 0004 + ext wave64 0008 to stable-diffusion.cpp"
 
     # This ggml is on a different commit, so an ambiguous hunk can land on the wrong
