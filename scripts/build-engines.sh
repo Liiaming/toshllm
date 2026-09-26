@@ -358,6 +358,11 @@ build_image_engine() {
     git apply -p1 "$ROOT/patches/image/0060-image-qwen21-prefix-f16.patch"
     # The down projection takes its input in F16, which its tile loader rounds to anyway.
     git apply -p1 "$ROOT/patches/image/0061-image-qwen21-down-f16.patch"
+    # The q/k/v, output and gate/up projections take F16 inputs too, and the modulation skips
+    # a whole-tensor slice copy when there is no cached prefix.
+    git apply -p1 "$ROOT/patches/image/0062-image-qwen21-f16-inputs.patch"
+    # Flash attention reads Qwen-Image 2.1's F16 values through a permuted view instead of a copy.
+    git apply -p1 "$ROOT/patches/image/0063-image-qwen21-v-view.patch"
     echo "applied ggml-metal hunks of 0001 + 0003 + core fallback 0004 + ext wave64 0008 to stable-diffusion.cpp"
 
     # This ggml is on a different commit, so an ambiguous hunk can land on the wrong
