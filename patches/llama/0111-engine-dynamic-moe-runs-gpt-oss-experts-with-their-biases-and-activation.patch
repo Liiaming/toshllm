@@ -1,0 +1,242 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 98e4a1e..6e0910b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2235,13 +2235,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+     const llama_tosh_dmoe_layer * dmoe_bank = dmoe;
+     bool dmoe_shape_ok = false;
+     if (dmoe != nullptr) {
+         const bool plain_swiglu = type_op == LLM_FFN_SILU && (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
++        const bool oai = type_op == LLM_FFN_SWIGLU_OAI_MOE;
+         dmoe_shape_ok = !moe_cached && !gate_up_exps && up_exps && down_exps &&
+-            !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+-            !weight_before_ffn && plain_swiglu;
++            !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn && (plain_swiglu || oai) &&
++            llama_tosh_dmoe_accept(dmoe, oai ? 1 : 0, oai ? 1.702f : 0.0f, oai ? 7.0f : 0.0f,
++                                   gate_exps_b != nullptr, up_exps_b != nullptr);
+         if (!dmoe_shape_ok || n_tokens > TOSH_DMOE_MAX_TOKENS) {
+             dmoe = nullptr;
+         }
+     }
+     // a batch too wide for mixed execution still tells the residency policy what it routed
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 96c638e..19371bd 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1989,10 +1989,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         used_ids.clear();
+                         used_ids.resize(ggml_bitset_size(n_expert));
+                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
++                                if (id < 0 && tosh_dmoe_compact()) {
++                                    continue;   // a row the host computes
++                                }
+                                 GGML_ASSERT(id >= 0 && id < n_expert);
+                                 ggml_bitset_set(used_ids.data(), id);
+                             }
+                         }
+ 
+@@ -2013,13 +2016,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             // this is necessary for MMQ in the CUDA backend
+                             expert_size_copy + padding_end);
+                     };
+ 
+                     int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
++                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
+                         id++;
+                     }
++                    if (id == n_expert) {
++                        continue;   // every row runs on the host
++                    }
+                     int32_t first_id = id;
+                     int32_t last_id = first_id;
+ 
+                     for (++id; id < n_expert; ++id) {
+                         if (!ggml_bitset_get(used_ids.data(), id)) {
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 1eb0588..fb8e5f9 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -50,10 +50,11 @@ void llama_tosh_dmoe_budget(size_t) {}
+ bool llama_tosh_dmoe_rebudget_possible() { return false; }
+ void llama_tosh_dmoe_context_opened() {}
+ void llama_tosh_dmoe_context_closed() {}
+ void llama_tosh_dmoe_shutdown() {}
+ bool llama_tosh_dmoe_observe_prefill() { return false; }
++bool llama_tosh_dmoe_accept(const llama_tosh_dmoe_layer *, int, float, float, bool, bool) { return false; }
+ int  llama_tosh_dmoe_rare_rows() { return 0; }
+ int  llama_tosh_dmoe_rare_tail() { return 0; }
+ int  llama_tosh_dmoe_wide_min_tokens() { return 1 << 30; }
+ 
+ #else
+@@ -69,10 +70,18 @@ static double us_since(clk::time_point t0) {
+ // The canonical bank of one layer, read in place by the host executor.
+ struct host_bank {
+     const ggml_tensor * gate = nullptr;
+     const ggml_tensor * up   = nullptr;
+     const ggml_tensor * down = nullptr;
++    // per-expert gate/up biases, copied at load; the down bias is added on the GPU after the join
++    std::vector<float> gate_b, up_b;
++    // activation the graph registered for this layer: -1 none yet, 0 silu, 1 swiglu_oai
++    std::atomic<int> act{-1};
++    float alpha = 0.0f, limit = 0.0f;
++    host_bank() = default;
++    host_bank(const host_bank & o) : gate(o.gate), up(o.up), down(o.down), gate_b(o.gate_b), up_b(o.up_b),
++        act(o.act.load()), alpha(o.alpha), limit(o.limit) {}
+ };
+ 
+ struct miss {
+     int t;      // token
+     int j;      // router position
+@@ -170,15 +179,27 @@ struct executor {
+             const int r0 = (c % c1)*rows1;
+             const char * g = (const char *) bank->gate->data + (size_t) m.e*bank->gate->nb[2];
+             const char * u = (const char *) bank->up->data   + (size_t) m.e*bank->up->nb[2];
+             const void * a = act_q.data() + (size_t) m.t*act_q_row;
+             float * hr = h.data() + (size_t) (c/c1)*n_ff;
++            const float * gb = bank->gate_b.empty() ? nullptr : bank->gate_b.data() + (size_t) m.e*n_ff;
++            const float * ub = bank->up_b.empty()   ? nullptr : bank->up_b.data()   + (size_t) m.e*n_ff;
++            const bool oai = bank->act.load(std::memory_order_relaxed) == 1;
+             for (int r = r0; r < r0 + rows1; ++r) {
+                 float sg, su;
+                 tt_gate->vec_dot(n_embd, &sg, 0, g + (size_t) r*bank->gate->nb[1], 0, a, 0, 1);
+                 tt_up  ->vec_dot(n_embd, &su, 0, u + (size_t) r*bank->up->nb[1],   0, a, 0, 1);
+-                hr[r] = sg/(1.0f + expf(-sg))*su;
++                if (gb) sg += gb[r];
++                if (ub) su += ub[r];
++                if (oai) {
++                    // same form as ggml_swiglu_oai
++                    const float x = std::min(sg, bank->limit);
++                    const float y = std::clamp(su, -bank->limit, bank->limit);
++                    hr[r] = x/(1.0f + expf(-bank->alpha*x))*(y + 1.0f);
++                } else {
++                    hr[r] = sg/(1.0f + expf(-sg))*su;
++                }
+             }
+         }
+         barrier();
+         if (tid == 0) {
+             us_p1 += (uint64_t) us_since(t1);
+@@ -1210,10 +1231,30 @@ static void dmoe_report_at_exit() {
+     }
+ }
+ 
+ }
+ 
++bool llama_tosh_dmoe_accept(const llama_tosh_dmoe_layer * dl, int act, float alpha, float limit, bool gate_b, bool up_b) {
++    if (g_exec == nullptr || dl == nullptr || dl->il < 0 || dl->il >= (int) g_exec->banks.size()) {
++        return false;
++    }
++    host_bank & b = g_exec->banks[dl->il];
++    if (b.gate == nullptr || gate_b != !b.gate_b.empty() || up_b != !b.up_b.empty()) {
++        return false;
++    }
++    if (act != 0 && !(act == 1 && alpha > 0.0f && limit > 0.0f)) {
++        return false;
++    }
++    // graphs are built on one thread; the first one fixes the layer's activation
++    if (b.act.load() < 0) {
++        b.alpha = alpha;
++        b.limit = limit;
++        b.act.store(act);
++    }
++    return b.act.load() == act && (act == 0 || (b.alpha == alpha && b.limit == limit));
++}
++
+ int llama_tosh_dmoe_rare_rows() {
+     // a number fixes the threshold; auto starts low and lets the controller move it
+     static const int rows = [] {
+         const char * v = getenv("TOSH_DMOE_RARE_ROWS");
+         if (v == nullptr) return 0;
+@@ -1463,13 +1504,26 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+         for (const ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }) {
+             if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                 throw std::runtime_error("TOSH_DMOE_RESIDENCY needs every expert bank in host memory (-ncmoe covering all layers)");
+             }
+         }
+-        ex->banks[il] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
++        host_bank & hb = ex->banks[il];
++        hb.gate = L.ffn_gate_exps;
++        hb.up   = L.ffn_up_exps;
++        hb.down = L.ffn_down_exps;
+         ex->n_embd = (int) L.ffn_gate_exps->ne[0];
+         ex->n_ff   = (int) L.ffn_gate_exps->ne[1];
++        for (auto [b, dst] : { std::pair{ L.ffn_gate_exps_b, &hb.gate_b }, { L.ffn_up_exps_b, &hb.up_b } }) {
++            if (b == nullptr) {
++                continue;
++            }
++            if (b->type != GGML_TYPE_F32 || b->ne[0] != L.ffn_gate_exps->ne[1] || b->ne[1] != n_expert) {
++                throw std::runtime_error("TOSH_DMOE_CACHE_MIB: expert biases of an unexpected type or shape");
++            }
++            dst->resize(ggml_nelements(b));
++            ggml_backend_tensor_get(b, dst->data(), 0, ggml_nbytes(b));
++        }
+ 
+         llama_tosh_dmoe_layer dl;
+         dl.il      = il;
+         dl.n_slots = dynamic ? quota : (int) resident[il].size();
+         const int64_t ns = std::max(1, dl.n_slots);
+@@ -1563,11 +1617,12 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+         pol->budget       = (int) envf("TOSH_DMOE_BUDGET", 0);
+         if (pol->budget <= 0) pol->budget = n_layer*n_expert;
+         pol->stop_after   = (long) envf("TOSH_DMOE_PROMO_STOP", -1);
+         pol->warm_prefill = envf("TOSH_DMOE_WARM_PREFILL", 1) != 0;
+         pol->tok_decay    = tosh_dmoe_token_decay();
+-        pol->reserve      = (int) envf("TOSH_DMOE_LEND_RESERVE", 8);
++        // a layer with few slots cannot empty eight of them every chunk and still keep a working set
++        pol->reserve      = (int) envf("TOSH_DMOE_LEND_RESERVE", std::min(8, quota/8));
+         pol->reserve_tail = (int) envf("TOSH_DMOE_LEND_TAIL", 8);
+         pol->verify_every = (long) envf("TOSH_DMOE_VERIFY", 0);
+         pol->defer_wide   = envf("TOSH_DMOE_DEFER_WIDE", 0) != 0;
+         pol->vram_promote = envf("TOSH_DMOE_PREFILL_PROMOTE", 1) != 0;
+         pol->vplan.resize(n_layer);
+diff --git a/src/llama-tosh-dmoe.h b/src/llama-tosh-dmoe.h
+index 9d88b34..635b021 100644
+--- a/src/llama-tosh-dmoe.h
++++ b/src/llama-tosh-dmoe.h
+@@ -21,10 +21,14 @@ struct llama_tosh_dmoe_layer {
+ };
+ 
+ // Enabled by TOSH_DMOE_RESIDENCY=<file of "layer expert" lines>. No-op otherwise.
+ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams);
+ 
++// Whether the host executor can run this layer's experts: act 0 is silu, 1 swiglu_oai(alpha, limit),
++// and the gate/up biases the graph adds must be the ones copied at load.
++bool llama_tosh_dmoe_accept(const llama_tosh_dmoe_layer * dl, int act, float alpha, float limit, bool gate_b, bool up_b);
++
+ // Whether wide batches report their routing to the residency policy.
+ bool llama_tosh_dmoe_observe_prefill();
+ 
+ // Wide batches: experts routed to at most this many rows of the chunk and not resident run on
+ // the host (TOSH_DMOE_RARE_ROWS); 0 when off. Only batches the GPU takes, from the offload size.
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 3b4ec97..bf51301 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1250,13 +1250,20 @@ static uint64_t ggml_metal_dmoe_upload_impl(void * ctx_raw, const struct tosh_dm
+     }
+     size_t total = 0;
+     for (int i = 0; i < n; ++i) {
+         total += copies[i].size;
+     }
+-    if (total > DMOE_UP_BYTES) {
+-        [up->lock unlock];
+-        return 0;
++    if (total > [up->stage[s] length]) {
++        // a stage slot grows once to the largest expert, so staging stays bounded by 8 experts
++        id<MTLBuffer> grown = [up->dev->mtl_device newBufferWithLength:(total + (1u << 20) - 1)/(1u << 20)*(1u << 20)
++                                                               options:MTLResourceStorageModeShared];
++        if (grown == nil) {
++            [up->lock unlock];
++            return 0;
++        }
++        [up->stage[s] release];
++        up->stage[s] = grown;
+     }
+     char * stage = [up->stage[s] contents];
+     size_t off = 0;
+     id<MTLCommandBuffer> cb = [up->queue commandBuffer];
+     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
