@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **LLMs: Dynamic MoE keeps a MoE model's most used experts in VRAM and the rest in RAM, chosen automatically for the context you ask for.** It keeps about 1 GiB of VRAM free and shows the plan before loading. On a Radeon RX 6700 XT Qwen3.6-35B-A3B generates 47 tokens a second at 8K and 32K instead of about 31 with experts on the CPU, and Gemma 4 26B-A4B 40 at 8K instead of 21.
+
 ### Improved
 
 - **Images: Qwen-Image 2.1 edits with reference images take about a quarter of the time.** The text and reference part of the prompt is computed once per image instead of at every step: on a Radeon RX 6700 XT at 1024x1024 a step with one reference goes from 28.5 to 7.9 seconds, and with two from 43.9 to 9.1, so a 25-step edit with two references takes under 5 minutes instead of about 19. On cards with 8 GB the reference edit falls back to the previous speed when this does not fit.

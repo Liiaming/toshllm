@@ -111,6 +111,13 @@ enum SettingsKeys {
     static let prefetchExperts = "prefetchExperts"
     /// Micro-batch size (--ubatch-size). 0 keeps the engine default of 512.
     static let ubatch = "ubatch"
+    /// Context-first memory plan by the engine (TOSH_AUTO): picks full GPU, Dynamic MoE or
+    /// expert offload, the KV type and the batch for the requested context.
+    static let autoMemoryPlan = "autoMemoryPlan"
+    /// auto | full | dmoe | legacy
+    static let executionMode = "executionMode"
+    /// auto | f16 | q8_0 | turbo4
+    static let autoKVMode = "autoKVMode"
     static let dynamicMoe = "dynamicMoe"
     static let dynamicMoeSlots = "dynamicMoeSlots"
     static let dynamicMoePrefetch = "dynamicMoePrefetch"

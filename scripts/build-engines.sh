@@ -181,6 +181,8 @@ build_engine() {
                     -I ggml/src -I ggml/src/ggml-metal \
                     -c "$src" -o "$kernels/$name.air" &&
                 "$METALLIB_COMPILER" "$kernels/$name.air" -o "$kernels/$name.metallib" || { ok=0; break; }
+                # the engine loads a library only if its source matches the one embedded in the binary
+                echo "$name $(shasum -a 256 "$src" | cut -d' ' -f1)" >> "$kernels/fingerprint"
             done
         else
             ok=0

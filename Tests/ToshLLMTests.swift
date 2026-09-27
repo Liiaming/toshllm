@@ -990,6 +990,50 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(args[args.firstIndex(of: "--cache-reuse")! + 1], "256")
     }
 
+    func testAutoMemoryPlanOwnsOffloadBatchAndCacheOnMoEModels() throws {
+        let model = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tosh-auto-plan-\(UUID().uuidString).gguf")
+        try writeMinimalMoEGGUF(model)
+        defer { try? FileManager.default.removeItem(at: model) }
+        var s = makeSettings()
+        s.modelPath = model.path
+        s.ubatch = 2048
+        s.cacheTypeK = "q8_0"
+        s.autoMemoryPlan = true
+
+        XCTAssertTrue(s.usesAutoPlan)
+        XCTAssertEqual(s.environment["TOSH_AUTO"], "1")
+        XCTAssertEqual(s.environment["TOSH_AUTO_KV"], "auto")
+        XCTAssertEqual(s.environment["TOSH_AUTO_PLAN_FILE"], AutoMemoryPlan.planURL(port: s.port).path)
+        XCTAssertFalse(s.arguments.contains("--n-cpu-moe"), "the plan decides the offload")
+        XCTAssertFalse(s.arguments.contains("--ubatch-size"), "the plan decides the batch")
+        XCTAssertFalse(s.arguments.contains("-ctk"), "the plan decides the cache type")
+        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "-fa")! + 1], "1")
+        XCTAssertFalse(s.effectiveDynamicMoe, "the older cache stays off under the plan")
+
+        s.planWithoutDMoE = true
+        XCTAssertEqual(s.environment["TOSH_AUTO"], "nodmoe")
+
+        s.executionMode = "full"
+        XCTAssertFalse(s.usesAutoPlan)
+        XCTAssertTrue(s.manualFullGPU)
+        XCTAssertNil(s.environment["TOSH_AUTO"])
+        XCTAssertFalse(s.arguments.contains("--n-cpu-moe"), "manual full GPU offloads nothing")
+
+        s.executionMode = "legacy"
+        XCTAssertFalse(s.usesAutoPlan)
+        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--n-cpu-moe")! + 1], "24")
+    }
+
+    func testAutoMemoryPlanDecodesTheEnginePlan() throws {
+        let json = #"{"state": "DMOE_CONTEXT_OPTIMAL", "mode": "dmoe", "reason": "r", "fallback": "", "kv": "f16", "n_ctx": 32768, "ubatch": 2048, "ncmoe": 0, "reserve_mib": 975, "arena_mib": 7867, "min_arena_mib": 1210, "projected_private_mib": 11000, "projected_free_mib": 975, "vram_total_mib": 12266, "vram_free_mib": 11960, "host_required_mib": 11200, "host_ram_mib": 32768, "host_available_mib": 26000, "host_reserve_mib": 8192, "bank_mib": 9682, "mlock": "required", "dispersion": "high", "candidates": [{"name": "full_gpu+f16", "mode": "full_gpu", "kv": "f16", "valid": false, "reason": "x", "ubatch": 512, "ncmoe": 0, "private_mib": 12000, "free_mib": 260, "arena_mib": 0, "kv_mib": 786, "compute_mib": 196}]}"#
+        let plan = try XCTUnwrap(AutoMemoryPlan.decode(Data(json.utf8)))
+        XCTAssertTrue(plan.usesDynamicMoE)
+        XCTAssertEqual(plan.nCtx, 32768)
+        XCTAssertEqual(plan.candidates.first?.freeMib, 260)
+        XCTAssertTrue(AutoMemoryText.summary(plan, runtime: nil).contains("Dynamic MoE"))
+    }
+
     func testDynamicMoeIsCompiledButRequiresPrivateUIFlagAndToggle() throws {
         let model = FileManager.default.temporaryDirectory
             .appendingPathComponent("tosh-dynamic-moe-\(UUID().uuidString).gguf")

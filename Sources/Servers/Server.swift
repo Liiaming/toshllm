@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import Foundation
+import CryptoKit
 import Metal
 
 extension Notification.Name {
@@ -184,6 +185,14 @@ struct ServerSettings {
     var benchPP: Int = 512
     var benchTG: Int = 128
     var benchDepth: Int = 0
+    /// The engine plans memory for the requested context (see AutoMemoryPlan).
+    var autoMemoryPlan: Bool = false
+    var executionMode: String = "auto"
+    var autoKVMode: String = "auto"
+    /// Set by the controller from the preview before launch; nil until then.
+    var plannedMode: String? = nil
+    /// The retry after Dynamic MoE could not lock its expert bank plans without it.
+    var planWithoutDMoE: Bool = false
 
     /// One model served across several GPUs, either by the all/N toggle or by an
     /// explicit selection of at least two cards.
@@ -328,8 +337,10 @@ struct ServerSettings {
             "--host", localNetworkDiscovery ? "0.0.0.0" : "127.0.0.1",
             "--port", String(port),
         ]
-        if !effectiveDynamicMoe && ncmoe > 0 { args += ["--n-cpu-moe", String(ncmoe)] }
-        if let ub = effectiveUbatch { args += ["--ubatch-size", String(ub), "--batch-size", String(ub)] }
+        // under the plan the engine picks offload and batch; by hand, Full GPU offloads nothing
+        let planOwnsMemory = usesAutoPlan || manualFullGPU
+        if !effectiveDynamicMoe && ncmoe > 0 && !planOwnsMemory { args += ["--n-cpu-moe", String(ncmoe)] }
+        if !usesAutoPlan, let ub = effectiveUbatch { args += ["--ubatch-size", String(ub), "--batch-size", String(ub)] }
         let mode = effectiveDynamicMoe ? "mlock" : Self.loadMode(noMmap: noMmap, mlock: mlock)
         if let mode { args += ["--load-mode", mode] }
         if effectiveDynamicMoe {
@@ -343,8 +354,10 @@ struct ServerSettings {
             if imageMaxTokens > 0 { args += ["--image-max-tokens", String(imageMaxTokens)] }
         }
         if jinja || mmproj != nil { args.append("--jinja") }
-        if cacheTypeK != "f16" { args += ["-ctk", cacheTypeK] }
-        if cacheTypeV != "f16" { args += ["-ctv", cacheTypeV] }
+        if !usesAutoPlan {
+            if launchKV.k != "f16" { args += ["-ctk", launchKV.k] }
+            if launchKV.v != "f16" { args += ["-ctv", launchKV.v] }
+        }
         // localhost-only endpoint; feeds the speculative-decoding readout in Diagnostics
         args.append("--metrics")
         args += ["--cache-ram", String(cacheRAM)]
@@ -376,7 +389,9 @@ struct ServerSettings {
         // A compatible downloaded DFlash draft takes precedence over embedded MTP.
         // Speculation decodes several tokens at once and the expert cache only has slots
         // for one token's experts, so the two cannot run together.
-        if !effectiveDynamicMoe {
+        // a draft is only planned for next to a full model on the GPU
+        let speculationAllowed = !usesAutoPlan || plannedMode == "full_gpu"
+        if !effectiveDynamicMoe && speculationAllowed {
             if let selection = dflashSelection(modelPath: modelPath, ncmoe: ncmoe) {
                 // Quantize the draft's KV cache: it doubles KV pressure at high ctx, and
                 // q8_0 halves that footprint at no measurable quality cost for a draft.
@@ -672,7 +687,11 @@ struct ServerSettings {
         }
         // Router mode has no single ncmoe (it's per-model, in the INI); the envs are
         // no-ops for dense models anyway.
-        if effectiveDynamicMoe {
+        if usesAutoPlan {
+            env["TOSH_AUTO"] = planWithoutDMoE ? "nodmoe" : (executionMode == "dmoe" ? "dmoe" : "1")
+            env["TOSH_AUTO_KV"] = autoKVMode
+            env["TOSH_AUTO_PLAN_FILE"] = AutoMemoryPlan.planURL(port: port).path
+        } else if effectiveDynamicMoe {
             env["TOSH_MOE_MODE"] = "cache"
             if dynamicMoePolicy == "auto" { env["TOSH_MOE_AUTO"] = "1" }
             env["TOSH_MOE_SLOTS"] = String(effectiveDynamicMoeSlots)
@@ -696,7 +715,7 @@ struct ServerSettings {
                     }
                 }
             }
-        } else if prefetchExperts && (ncmoe > 0 || routerMode) {
+        } else if prefetchExperts && ((ncmoe > 0 && !manualFullGPU) || routerMode) {
             // At/above the measured cliff the prefetch overlap collapses and stalls the
             // GPU, so stay below it. Router mode has no single ncmoe to compare.
             let cliff = Self.recalledPrefetchCliff(forModel: modelPath)
@@ -832,7 +851,10 @@ struct ServerSettings {
             imageMaxTokens: int(SettingsKeys.imageMaxTokens, 0),
             benchPP: int(SettingsKeys.benchPP, 512),
             benchTG: int(SettingsKeys.benchTG, 128),
-            benchDepth: int(SettingsKeys.benchDepth, 0))
+            benchDepth: int(SettingsKeys.benchDepth, 0),
+            autoMemoryPlan: bool(SettingsKeys.autoMemoryPlan, true),
+            executionMode: d.string(forKey: SettingsKeys.executionMode) ?? "auto",
+            autoKVMode: d.string(forKey: SettingsKeys.autoKVMode) ?? "auto")
     }
 
     /// True when the model's attention head dim exceeds 256 (Gemma 4's global layers
@@ -865,7 +887,8 @@ struct ServerSettings {
     }
 
     var kvNeedsFlashAttention: Bool {
-        cacheTypeK != "f16" || cacheTypeV != "f16"
+        // the plan may pick a quantized cache, and it was measured with flash attention on
+        usesAutoPlan || launchKV.k != "f16" || launchKV.v != "f16"
     }
 
     /// The user's AMD Flash-Attention choice. Quantized KV may still force
@@ -927,8 +950,23 @@ struct ServerSettings {
         guard routerMode || Self.modelIsMoE(at: modelPath) else { return nil }
         return ubatch
     }
+    /// The engine plans memory: MoE models under Auto or forced Dynamic MoE, on one GPU.
+    var usesAutoPlan: Bool {
+        autoMemoryPlan && (executionMode == "auto" || executionMode == "dmoe")
+            && !routerMode && !isSplitting && Self.modelIsMoE(at: modelPath)
+    }
+    /// Full GPU chosen by hand: no expert offload, even where Auto would reject the headroom.
+    var manualFullGPU: Bool { autoMemoryPlan && executionMode == "full" }
+    /// Cache types the launch passes itself; under the plan the engine picks them.
+    var launchKV: (k: String, v: String) {
+        if manualFullGPU {
+            let kv = autoKVMode == "auto" ? "f16" : autoKVMode
+            return (kv, kv)
+        }
+        return (cacheTypeK, cacheTypeV)
+    }
     var effectiveDynamicMoe: Bool {
-        guard dynamicMoe && dynamicMoeUIUnlocked,
+        guard !usesAutoPlan, !manualFullGPU, dynamicMoe && dynamicMoeUIUnlocked,
               Self.modelIsMoE(at: modelPath), dynamicMoeModelInfo != nil else { return false }
         if dynamicMoePolicy == "auto" { return dynamicMoeAutoRoute == .cache }
         return !routerMode && !isSplitting
@@ -1765,6 +1803,12 @@ final class ServerController: ObservableObject {
     /// Model whose running engine actually has DFlash engaged, nil otherwise.
     @Published private(set) var activeDflashModelPath: String?
     @Published var dflashAcceptance: Double?
+    /// The engine's memory plan for this launch (preview), then what it really did.
+    @Published var autoPlan: AutoMemoryPlan?
+    @Published var autoRuntime: AutoMemoryRuntime?
+    @Published var autoPlanNote: String?
+    /// A starved host executor leaves the backend unusable; one restart per launch recovers it.
+    private var recoveredFromExecutorFailure = false
 
     private var process: Process?
     private var healthTask: Task<Void, Never>?
@@ -1913,13 +1957,82 @@ final class ServerController: ObservableObject {
         // holds the port meanwhile, so wait for the previous PID before binding.
         let previousPID = lastStoppedPID
         lastStoppedPID = nil
+        autoPlan = nil
+        autoRuntime = nil
+        autoPlanNote = nil
         Task { [weak self] in
             if let pid = previousPID {
                 for _ in 0..<24 where kill(pid, 0) == 0 {
                     try? await Task.sleep(for: .milliseconds(250))
                 }
             }
-            self?.launch(settings)
+            var planned = settings
+            if settings.usesAutoPlan {
+                guard let plan = await AutoMemoryPlan.preview(settings: settings) else {
+                    self?.failAutoPlan(nil)
+                    return
+                }
+                guard !plan.isUnsupported else {
+                    self?.failAutoPlan(plan)
+                    return
+                }
+                planned.plannedMode = plan.mode
+                self?.autoPlan = plan
+            }
+            self?.launch(planned)
+        }
+    }
+
+    private func restartAfterFailure(_ settings: ServerSettings) {
+        stop()
+        Task { [weak self] in
+            for _ in 0..<40 {
+                guard let self else { return }
+                if self.state == .stopped || self.isFailed {
+                    let note = self.autoPlanNote
+                    self.start(settings)
+                    self.autoPlanNote = note
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    private func failAutoPlan(_ plan: AutoMemoryPlan?) {
+        guard state == .starting else { return }
+        autoPlan = plan
+        let lang = UserDefaults.standard.string(forKey: SettingsKeys.language) ?? "en"
+        state = .failed(plan.map { AutoMemoryText.reason($0) } ?? (lang == "es"
+            ? "El motor no pudo planificar la memoria para este modelo; revisa el registro."
+            : "The engine could not plan memory for this model; check the log."))
+    }
+
+    /// The preview is a projection; the engine's runtime file says what really started. A planned
+    /// Dynamic MoE that did not start (its bank could not be locked) relaunches on the next plan.
+    private func confirmAutoRuntime(_ settings: ServerSettings) {
+        guard settings.usesAutoPlan else { return }
+        let plan = AutoMemoryPlan.readPlan(port: settings.port) ?? autoPlan
+        autoPlan = plan
+        let runtime = AutoMemoryRuntime.read(port: settings.port)
+        autoRuntime = runtime
+        guard let plan, plan.usesDynamicMoE else { return }
+        if runtime?.isOn == true { return }
+        let problem = runtime.flatMap(AutoMemoryText.runtimeProblem)
+        autoPlanNote = problem
+        guard !settings.planWithoutDMoE else { return }
+        consume("\n[ToshLLM] \(problem ?? "Dynamic MoE did not start") — replanning without it\n")
+        var retry = settings
+        retry.planWithoutDMoE = true
+        stop()
+        Task { [weak self] in
+            for _ in 0..<40 {
+                guard let self, self.state == .stopped || self.isFailed else {
+                    try? await Task.sleep(for: .milliseconds(250)); continue
+                }
+                self.start(retry)
+                return
+            }
         }
     }
 
@@ -1932,6 +2045,14 @@ final class ServerController: ObservableObject {
 
     /// Header at the top of the server log: version, engine, model, GPUs and the
     /// resolved settings, so a pasted log is debuggable without round-trips.
+    /// Short id of the precompiled kernels next to the engine; the engine refuses them itself
+    /// when they were built from other sources.
+    nonisolated static func kernelFingerprint(binary: String) -> String {
+        let url = URL(fileURLWithPath: binary).deletingLastPathComponent().appendingPathComponent("kernels/fingerprint")
+        guard let data = try? Data(contentsOf: url) else { return "embedded" }
+        return SHA256.hash(data: data).prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+
     nonisolated static func startupBanner(settings: ServerSettings) -> String {
         func redact(_ items: [String]) -> [String] {
             var out = items
@@ -1948,7 +2069,7 @@ final class ServerController: ObservableObject {
                 : " · peer group \($0.peerGroupID) (\($0.peerCount) GPUs)"
             return "    [\($0.index)] \($0.name) · \($0.vramGB) GB\(peer)\($0.isExternal ? " · EXTERNAL/eGPU" : "")\($0.isIntegrated ? " · iGPU (not auto-selected)" : "")"
         }.joined(separator: "\n")
-        let envKeys = ["GGML_METAL_VRAM_RESERVE_MB",
+        let envKeys = ["TOSH_AUTO", "TOSH_AUTO_KV", "GGML_METAL_VRAM_RESERVE_MB",
                        "GGML_METAL_DEVICE_INDEX", "GGML_METAL_DEVICES", "GGML_METAL_DEVICE_LIST",
                        "GGML_METAL_SHARED_BUFFERS_DISABLE", "TOSH_FA_AMD",
                        "GGML_SCHED_PREFETCH_EXPERTS", "GGML_CPU_NO_REPACK",
@@ -1964,7 +2085,9 @@ final class ServerController: ObservableObject {
         let envLine = (envKeys + userKeys)
             .compactMap { k in env[k].map { "\(k)=\($0)" } }
             .joined(separator: " ")
-        let moeLine = settings.effectiveDynamicMoe
+        let moeLine = settings.usesAutoPlan
+            ? "memory=auto-plan (\(settings.executionMode), kv \(settings.autoKVMode))"
+            : settings.manualFullGPU ? "memory=full-gpu (manual)" : settings.effectiveDynamicMoe
             ? "ncmoe=0 dynamic-moe=K\(settings.effectiveDynamicMoeSlots)"
             : "ncmoe=\(settings.ncmoe)"
         var gpuSel = settings.multiGPU ? "split-all" : (settings.gpuIndex >= 0 ? "index \(settings.gpuIndex)" : "default (macOS picks)")
@@ -1975,7 +2098,7 @@ final class ServerController: ObservableObject {
         return """
         ========================================================
          ToshLLM \(AppInfo.version) — server start (\(ServerSettings.isAppleSilicon ? "arm64" : "x86_64")\(AppInfo.isNoAVX2 ? " · no-AVX2 build" : ""))
-         engine : \(engine)
+         engine : \(engine) · kernels \(kernelFingerprint(binary: settings.serverBinary))
          model  : \(settings.routerMode ? "router (autoload, max \(settings.routerModelsMax) loaded)" : (settings.modelPath as NSString).lastPathComponent)
          GPUs detected:
         \(gpus.isEmpty ? "    (none)" : gpus)
@@ -2068,6 +2191,9 @@ final class ServerController: ObservableObject {
 
         fileLog.startSession()   // new timestamped per-session file, prunes old ones
         consume(Self.startupBanner(settings: settings))
+        if let plan = autoPlan {
+            consume("[ToshLLM] memory plan: \(AutoMemoryText.summary(plan, runtime: nil)) | \(AutoMemoryText.reason(plan))\n")
+        }
         do {
             try p.run()
             process = p
@@ -2303,6 +2429,7 @@ final class ServerController: ObservableObject {
                     await MainActor.run {
                         self?.state = .running
                         self?.startedAt = Date()
+                        if let settings = self?.launchedSettings { self?.confirmAutoRuntime(settings) }
                         self?.startDiscoveryIfNeeded(port: port)
                         self?.startDflashMemoryCheck()
                     }
@@ -2425,6 +2552,14 @@ final class ServerController: ObservableObject {
         fileLog.append(text)
 
         for line in text.split(separator: "\n") {
+            if line.contains("mixed expert execution failed"), !recoveredFromExecutorFailure,
+               state == .running, let settings = launchedSettings {
+                recoveredFromExecutorFailure = true
+                autoPlanNote = (UserDefaults.standard.string(forKey: SettingsKeys.language) ?? "en") == "es"
+                    ? "El sistema dejó sin CPU a Dynamic MoE; el servidor se reinició."
+                    : "The system starved Dynamic MoE of CPU; the server was restarted."
+                restartAfterFailure(settings)
+            }
             if line.contains("draft acceptance ="),
                let m = line.range(of: #"draft acceptance = ([0-9]+\.[0-9]+)"#, options: .regularExpression) {
                 dflashAcceptance = Double(line[m].split(separator: "=")[1].trimmingCharacters(in: .whitespaces))

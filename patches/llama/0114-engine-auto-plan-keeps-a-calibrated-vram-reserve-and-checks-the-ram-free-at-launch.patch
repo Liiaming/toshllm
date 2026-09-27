@@ -1,0 +1,170 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index bceb0c84c..1b3d66721 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -24,10 +24,17 @@
+ #include <sys/sysctl.h>
+ #endif
+ 
+ static constexpr double MiB = 1048576.0;
+ 
++// safety reserve: a share of the card, bounded on small and large cards
++static constexpr double RESERVE_FRACTION = 0.08;
++static constexpr double RESERVE_MIN_MIB  = 768.0;
++static constexpr double RESERVE_MAX_MIB  = 1536.0;
++// RAM left to the rest of the system once a plan's host memory is taken
++static constexpr double HOST_MARGIN_MIB  = 2048.0;
++
+ namespace {
+ 
+ struct moe_info {
+     bool   moe       = false;
+     int    n_layer   = 0;
+@@ -42,10 +49,11 @@ struct moe_info {
+ 
+ struct host_mem {
+     double ram_mib        = 0;
+     double wired_mib      = 0;
+     double wire_limit_mib = 0;
++    double available_mib  = 0;   // what the system can hand out now without compressing or swapping
+ };
+ 
+ struct probe {
+     bool   ok = false;
+     double model = 0, context = 0, compute = 0;   // GPU, MiB
+@@ -107,16 +115,18 @@ host_mem read_host_info() {
+     if (sysctlbyname("vm.user_wire_limit", &lim, &len, nullptr, 0) == 0) h.wire_limit_mib = lim/MiB;
+     vm_statistics64_data_t vs;
+     mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) == KERN_SUCCESS) {
+         h.wired_mib = (double) vs.wire_count*vm_page_size/MiB;
++        h.available_mib = (double) (vs.free_count + vs.inactive_count + vs.speculative_count + vs.purgeable_count)*vm_page_size/MiB;
+     }
+ #endif
+     const double sim = env_mib("TOSH_AUTO_SIM_RAM_MIB", 0);
+     if (sim > 0) {
+         h.wired_mib = std::max(0.0, h.wired_mib - h.ram_mib + sim);
+         h.wire_limit_mib = h.wire_limit_mib > 0 ? h.wire_limit_mib*sim/h.ram_mib : 0;
++        h.available_mib = std::min(h.available_mib, sim);
+         h.ram_mib = sim;
+     }
+     return h;
+ }
+ 
+@@ -229,12 +239,12 @@ std::string tosh_plan_json(const tosh_plan & p) {
+     o += ", \"kv\": " + jstr(kv_name(p.kv));
+     o += string_format(", \"n_ctx\": %d, \"ubatch\": %d, \"ncmoe\": %d", p.n_ctx, p.ubatch, p.ncmoe);
+     o += string_format(", \"reserve_mib\": %.0f, \"arena_mib\": %.0f, \"min_arena_mib\": %.0f", p.reserve_mib, p.arena_mib, p.min_arena_mib);
+     o += string_format(", \"projected_private_mib\": %.0f, \"projected_free_mib\": %.0f", p.private_mib, p.free_mib);
+     o += string_format(", \"vram_total_mib\": %.0f, \"vram_free_mib\": %.0f", p.vram_total_mib, p.vram_free_mib);
+-    o += string_format(", \"host_required_mib\": %.0f, \"host_ram_mib\": %.0f, \"host_reserve_mib\": %.0f, \"bank_mib\": %.0f",
+-                       p.host_required_mib, p.host_ram_mib, p.host_reserve_mib, p.bank_mib);
++    o += string_format(", \"host_required_mib\": %.0f, \"host_ram_mib\": %.0f, \"host_available_mib\": %.0f, \"host_reserve_mib\": %.0f, \"bank_mib\": %.0f",
++                       p.host_required_mib, p.host_ram_mib, p.host_available_mib, p.host_reserve_mib, p.bank_mib);
+     o += ", \"mlock\": " + jstr(p.mlock) + ", \"dispersion\": " + jstr(p.dispersion);
+     o += ", \"candidates\": [";
+     for (size_t i = 0; i < p.candidates.size(); ++i) {
+         const auto & c = p.candidates[i];
+         o += i ? ", {" : "{";
+@@ -278,11 +288,14 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     }
+     if (getenv("TOSH_DMOE_CACHE_MIB") != nullptr || getenv("TOSH_DMOE_RESIDENCY") != nullptr) {
+         LOG_WRN("%s: TOSH_DMOE_* set by hand, the auto plan steps aside\n", __func__);
+         return false;
+     }
+-    const std::string force = (strcmp(mode_env, "1") == 0 || strcmp(mode_env, "auto") == 0) ? "" : mode_env;
++    std::string force = (strcmp(mode_env, "1") == 0 || strcmp(mode_env, "auto") == 0) ? "" : mode_env;
++    // nodmoe: auto without mixed execution, the retry after the expert bank could not be locked
++    const bool no_dmoe = force == "nodmoe";
++    if (no_dmoe) force.clear();
+ 
+     tosh_plan p;
+     const moe_info mi = read_moe_info(params.model.path.c_str());
+     if (!mi.moe) {
+         if (out) *out = p;
+@@ -298,10 +311,11 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     const bool high = mi.n_expert > 0 && (double) mi.n_used/mi.n_expert > 1.0/16;
+     p.dispersion = high ? "high" : "normal";
+ 
+     const host_mem hi = read_host_info();
+     p.host_ram_mib     = hi.ram_mib;
++    p.host_available_mib = hi.available_mib;
+     p.host_reserve_mib = env_mib("TOSH_AUTO_HOST_RESERVE_MIB", std::max(6144.0, 0.25*hi.ram_mib));
+ 
+     // cache types to consider
+     std::vector<ggml_type> kvs;
+     const std::string kv_env = getenv("TOSH_AUTO_KV") ? getenv("TOSH_AUTO_KV") : "auto";
+@@ -352,10 +366,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     if (!dmoe_built) {
+         dmoe_block = "engine built without Dynamic MoE";
+     } else if (hi.ram_mib > 0 && host_dmoe + p.host_reserve_mib > hi.ram_mib) {
+         dmoe_block = string_format("host RAM: %.1f GiB needed + %.1f GiB reserve > %.1f GiB",
+                                    host_dmoe/1024, p.host_reserve_mib/1024, hi.ram_mib/1024);
++    } else if (hi.available_mib > 0 && host_dmoe + HOST_MARGIN_MIB > hi.available_mib) {
++        dmoe_block = string_format("host RAM: %.1f GiB needed, %.1f GiB available now", host_dmoe/1024, hi.available_mib/1024);
+     } else if (hi.wire_limit_mib > 0 && mi.bank_mib > hi.wire_limit_mib - hi.wired_mib) {
+         dmoe_block = string_format("DMOE_HOST_BANK_NOT_LOCKABLE: %.1f GiB bank > %.1f GiB lockable",
+                                    mi.bank_mib/1024, (hi.wire_limit_mib - hi.wired_mib)/1024);
+     }
+     p.mlock = dmoe_block.rfind("DMOE_HOST_BANK_NOT_LOCKABLE", 0) == 0 ? "not_lockable" : "required";
+@@ -408,11 +424,16 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+                     c.ncmoe = n; c.private_mib = priv; c.free_mib = p.vram_free_mib - priv; c.valid = true;
+                     break;
+                 }
+             }
+             c.kv_mib = pr.context; c.compute_mib = pr.compute;
+-            c.reason = c.valid ? string_format("%d layers of experts on the host", c.ncmoe) : "does not fit";
++            const double host_legacy = mi.bank_mib*c.ncmoe/std::max(1, mi.n_moe) + mi.embd_mib + 1024.0;
++            const bool host_ok = hi.available_mib <= 0 || host_legacy + HOST_MARGIN_MIB <= hi.available_mib;
++            c.reason = !c.valid ? "does not fit" : !host_ok ?
++                string_format("host RAM: %.1f GiB needed, %.1f GiB available now", host_legacy/1024, hi.available_mib/1024) :
++                string_format("%d layers of experts on the host", c.ncmoe);
++            c.valid = c.valid && host_ok;
+             p.candidates.push_back(c);
+         }
+     };
+ 
+     auto find = [&](const std::string & mode, ggml_type kv, int ub) -> tosh_plan_candidate * {
+@@ -433,20 +454,24 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         if (p.n_ctx <= 32768 && c1k && c1k->valid && a - c1k->arena_mib <= cost) return c1k;
+         return c512;
+     };
+ 
+     const tosh_plan_candidate * sel = nullptr;
+-    const double reserves[2] = { env_mib("TOSH_AUTO_RESERVE_MIB", 2560), env_mib("TOSH_AUTO_MIN_RESERVE_MIB", 2048) };
++    // VRAM kept free after every known allocation, for the desktop and other apps; the plan
++    // already counts weights, KV, compute, prefill slots and the driver margin
++    const double reserve_auto = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB);
++    const double reserve_pref = env_mib("TOSH_AUTO_RESERVE_MIB", reserve_auto);
++    const double reserves[2] = { reserve_pref, env_mib("TOSH_AUTO_MIN_RESERVE_MIB", std::max(512.0, reserve_pref - 256.0)) };
+     for (double R : reserves) {
+         evaluate(R);
+         const tosh_plan_candidate * f16 = find("full_gpu", kvs[0], 0);
+         const tosh_plan_candidate * q8  = kvs.size() > 1 ? find("full_gpu", kvs[1], 0) : nullptr;
+         if (force.empty() || force == "full") {
+             if (f16 && f16->valid) { sel = f16; p.reason = "the model and the requested context fit with the reserve"; }
+             else if (q8 && q8->valid) { sel = q8; p.reason = "q8_0 cache makes the full model fit with the reserve"; }
+         }
+-        if (sel == nullptr && (force.empty() || force == "dmoe")) {
++        if (sel == nullptr && !no_dmoe && (force.empty() || force == "dmoe")) {
+             tosh_plan_candidate * a = pick_ub(kvs[0]);
+             tosh_plan_candidate * b = kvs.size() > 1 ? pick_ub(kvs[1]) : nullptr;
+             // the q8_0 cache is worth it when its savings buy a material share of the bank
+             if (a && b && a->arena_mib < 0.9*mi.bank_mib && b->arena_mib - a->arena_mib >= 0.10*mi.bank_mib) {
+                 sel = b; p.reason = "q8_0 cache gives the expert arena a material share of the bank";
+diff --git a/common/tosh-plan.h b/common/tosh-plan.h
+index f895880e1..6175317d8 100644
+--- a/common/tosh-plan.h
++++ b/common/tosh-plan.h
+@@ -51,10 +51,11 @@ struct tosh_plan {
+     double      free_mib           = 0;
+     double      vram_total_mib     = 0;
+     double      vram_free_mib      = 0;
+     double      host_required_mib  = 0;
+     double      host_ram_mib       = 0;
++    double      host_available_mib = 0;
+     double      host_reserve_mib   = 0;
+     double      bank_mib           = 0;
+     std::string mlock;              // required, not_required, not_lockable
+     std::string dispersion;         // normal, high
+     std::vector<tosh_plan_candidate> candidates;

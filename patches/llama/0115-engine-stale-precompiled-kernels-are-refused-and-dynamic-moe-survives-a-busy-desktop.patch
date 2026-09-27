@@ -1,0 +1,226 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 5d7feb5b7..eef855916 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -24,10 +24,11 @@ static inline int tosh_moe_mode(void) { return TOSH_MOE_OFF; }
+ 
+ #include <stdatomic.h>
+ #include <unistd.h>
+ 
+ #import <IOKit/IOKitLib.h>
++#import <CommonCrypto/CommonDigest.h>
+ #import <CoreFoundation/CoreFoundation.h>
+ 
+ // The driver's own VRAM counters for this device: free, and in use by every process. Metal only
+ // reports this process's allocations and a working-set ceiling that host mappings also fill.
+ static bool ggml_metal_vram_stats(id<MTLDevice> d, int64_t * vfree, int64_t * vused) {
+@@ -342,21 +343,49 @@ static NSString * ggml_metal_library_flatten_source(NSString * path_source, NSEr
+     return src;
+ }
+ 
+ // Precompiled libraries next to the binary, instead of spending tens of seconds compiling the
+ // sources on every launch. They are built without the tensor API, so M5-class GPUs fall through.
+-static bool ggml_metal_library_load_precompiled(ggml_metal_library_t res, id<MTLDevice> device) {
++// kernels/fingerprint lists "<kind> <sha256 of its source>"; a library built from other sources
++// than the ones embedded in this binary is stale and is not loaded
++static bool ggml_metal_library_precompiled_matches(NSString * dir, NSString * const * want) {
++    NSString * text = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"fingerprint"]
++                                                encoding:NSUTF8StringEncoding error:nil];
++    if (text == nil) {
++        GGML_LOG_WARN("%s: precompiled kernels carry no fingerprint, compiling the embedded sources\n", __func__);
++        return false;
++    }
++    NSMutableDictionary<NSString *, NSString *> * have = [NSMutableDictionary dictionary];
++    for (NSString * line in [text componentsSeparatedByString:@"\n"]) {
++        NSArray<NSString *> * f = [line componentsSeparatedByString:@" "];
++        if (f.count == 2) have[f[0]] = f[1];
++    }
++    for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
++        NSString * name = [NSString stringWithUTF8String:k_lib_names[kind]];
++        if (![have[name] isEqualToString:want[kind]]) {
++            GGML_LOG_WARN("%s: precompiled '%s' was built from other sources, compiling the embedded ones\n",
++                          __func__, k_lib_names[kind]);
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool ggml_metal_library_load_precompiled(ggml_metal_library_t res, id<MTLDevice> device, NSString * const * want) {
+     if (ggml_metal_device_get_props(res->dev)->has_tensor) {
+         return false;
+     }
+ 
+     NSString * bin_cur = [[NSProcessInfo processInfo] arguments][0];
+     NSString * dir = [[bin_cur stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"kernels"];
+ 
+     if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+         return false;
+     }
++    if (!ggml_metal_library_precompiled_matches(dir, want)) {
++        return false;
++    }
+ 
+     const int64_t t_start = ggml_time_us();
+ 
+     for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+         NSString * path = [dir stringByAppendingPathComponent:
+@@ -541,14 +570,10 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
+ #endif
+ 
+ #if GGML_METAL_EMBED_LIBRARY
+     GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
+ 
+-    if (ggml_metal_library_load_precompiled(res, device)) {
+-        return res;
+-    }
+-
+     // start/end symbols emitted by CMake (see CMakeLists.txt), one pair per kind
+ #define X(e, s) extern const char ggml_metallib_##s##_start[]; extern const char ggml_metallib_##s##_end[];
+     GGML_METAL_LIBS
+ #undef X
+ 
+@@ -561,10 +586,32 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
+ #define X(e, s) [GGML_METAL_LIB_##e] = ggml_metallib_##s##_end,
+     GGML_METAL_LIBS
+ #undef X
+     };
+ 
++    // what these kernels were built from, to tell a stale precompiled library apart in a log
++    NSString * want[GGML_METAL_LIB_COUNT];
++    {
++        CC_SHA256_CTX all;
++        CC_SHA256_Init(&all);
++        for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
++            unsigned char d[CC_SHA256_DIGEST_LENGTH];
++            CC_SHA256(lib_start[kind], (CC_LONG) (lib_end[kind] - lib_start[kind]), d);
++            NSMutableString * hex = [NSMutableString stringWithCapacity:64];
++            for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) [hex appendFormat:@"%02x", d[i]];
++            want[kind] = hex;
++            CC_SHA256_Update(&all, d, sizeof(d));
++        }
++        unsigned char d[CC_SHA256_DIGEST_LENGTH];
++        CC_SHA256_Final(d, &all);
++        GGML_LOG_INFO("%s: kernel fingerprint %02x%02x%02x%02x%02x%02x\n", __func__, d[0], d[1], d[2], d[3], d[4], d[5]);
++    }
++
++    if (ggml_metal_library_load_precompiled(res, device, want)) {
++        return res;
++    }
++
+     const bool ok = ggml_metal_library_compile_all(res, device, prep,
+         ^NSString * (int kind, NSError ** err) {
+             (void) err;
+             return [[NSString alloc] initWithBytes:lib_start[kind]
+                                             length:(lib_end[kind] - lib_start[kind])
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 80e56ac64..8f1a973ed 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -24,10 +24,11 @@
+ #include <sstream>
+ #include <thread>
+ #include <unordered_map>
+ 
+ #include <sys/mman.h>
++#include <pthread.h>
+ #include <unistd.h>
+ #include <cerrno>
+ 
+ #if defined(__x86_64__)
+ #include <immintrin.h>
+@@ -143,10 +144,12 @@ struct executor {
+     }
+ 
+     std::vector<std::thread> helpers;
+     std::thread leader;
+     std::thread watchdog;
++    // the driver cancels a command buffer kept waiting 6 s (4 s measured safe on RDNA2)
++    double      watchdog_us = 3e6;
+ 
+     // dynamic residency: what the last job routed, handed to the policy once the GPU is released
+     void (*observe)(void * ctx, int il, const int32_t * ids, const int32_t * slots, int n, bool multi, uint32_t tick) = nullptr;
+     void * observe_ctx = nullptr;
+     int32_t obs_ids[TOSH_DMOE_MAX_TOKENS*256];
+@@ -243,10 +246,11 @@ struct executor {
+             us_p2 += (uint64_t) us_since(t2);
+         }
+     }
+ 
+     void helper_main(int tid) {
++        raise_priority();
+         uint64_t seen = 0;
+         while (!stop.load()) {
+             if (!tosh_dmoe_wait_active(1000000)) {
+                 continue;
+             }
+@@ -364,11 +368,12 @@ struct executor {
+         if ((long) n_jobs.load() == fail_at) {
+             tosh_dmoe_fail("injected failure");
+             return false;
+         }
+         if ((long) n_jobs.load() == stall_at) {
+-            std::this_thread::sleep_for(std::chrono::seconds(3));
++            static const long stall_ms = getenv("TOSH_DMOE_TEST_STALL_MS") ? atol(getenv("TOSH_DMOE_TEST_STALL_MS")) : 3000;
++            std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+         }
+ 
+         bank   = &banks[il];
+         n_used = jb.n_used;
+         act    = (const float *) (stage + tosh_dmoe_off_act(n_embd, n_used));
+@@ -424,10 +429,11 @@ struct executor {
+         us_job += (uint64_t) us_since(t0);
+         return true;
+     }
+ 
+     void leader_main() {
++        raise_priority();
+         uint64_t answered = 0;
+         clk::time_point last = clk::now();
+         bool was_active = false;
+         while (!stop.load()) {
+             if (!tosh_dmoe_wait_active(1000000)) {
+@@ -487,19 +493,26 @@ struct executor {
+             if (!pending || v != last) {
+                 last  = v;
+                 since = clk::now();
+                 continue;
+             }
+-            // well under the driver's command buffer timeout; a normal job takes under a millisecond
+-            if (us_since(since) > 1e6) {
+-                tosh_dmoe_fail("the host executor did not answer within 1 s");
++            // a normal job takes under a millisecond; a starved one must still beat the driver
++            if (us_since(since) > watchdog_us) {
++                tosh_dmoe_fail(format("the host executor did not answer within %.1f s", watchdog_us/1e6).c_str());
+                 tosh_dmoe_event_set(v + 1);
+                 since = clk::now();
+             }
+         }
+     }
+ 
++    // the GPU waits on these threads mid-graph: under a busy desktop they must not queue behind it
++    static void raise_priority() {
++#ifdef __APPLE__
++        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
++    }
++
+     void start() {
+         miss_by_layer   = std::vector<std::atomic<uint64_t>>(banks.size());
+         routed_by_layer = std::vector<std::atomic<uint64_t>>(banks.size());
+         hits_by_tick    = std::vector<std::atomic<uint32_t>>(1 << 16);
+         routed_by_tick  = std::vector<std::atomic<uint32_t>>(1 << 16);
+@@ -1557,10 +1570,13 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+     std::unique_ptr<executor> ex_owner(new executor());
+     auto * ex = ex_owner.get();
+     if (const char * v = getenv("TOSH_DMOE_SPIN_US")) {
+         ex->spin_us = atoi(v);
+     }
++    if (const char * v = getenv("TOSH_DMOE_WATCHDOG_MS")) {
++        ex->watchdog_us = atof(v)*1e3;
++    }
+     ex->banks.resize(n_layer);
+ 
+     ggml_init_params ip = { ggml_tensor_overhead()*(size_t) n_layer*4 + 1024, nullptr, true };
+     ggml_context * ctx = ggml_init(ip);
+ 

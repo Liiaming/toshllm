@@ -59,6 +59,9 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.parallelSlots) private var parallelSlots = 1
     @AppStorage(SettingsKeys.reasoningInline) private var reasoningInline = false
     @AppStorage(SettingsKeys.modelPath) private var modelPath = ""
+    @AppStorage(SettingsKeys.autoMemoryPlan) private var autoMemoryPlan = true
+    @AppStorage(SettingsKeys.executionMode) private var executionMode = "auto"
+    @AppStorage(SettingsKeys.autoKVMode) private var autoKVMode = "auto"
     @AppStorage(SettingsKeys.modelsDir) private var modelsDir = ""
     @AppStorage(SettingsKeys.menuBarIcon) private var menuBarIcon = true
     @AppStorage(SettingsKeys.updateAutoCheck) private var updateAutoCheck = true
@@ -689,6 +692,37 @@ struct SettingsView: View {
                 }
             }
 
+            Section(loc.t("Rendimiento y memoria", "Performance & Memory")) {
+                Toggle(loc.t("Auto (recomendado)", "Auto (recommended)"), isOn: $autoMemoryPlan)
+                    .settingsGlyph("wand.and.stars")
+                    .infoTip(loc.t("El motor reparte la VRAM por ti: primero el contexto que eliges y un margen seguro, y con lo que queda decide si el modelo va entero en la GPU, con Dynamic MoE (los expertos más usados en VRAM y el resto en RAM) o con expertos en CPU. También elige el tipo de KV y el tamaño de lote.",
+                                "The engine budgets VRAM for you: first the context you pick and a safe margin, then it decides whether the model runs whole on the GPU, with Dynamic MoE (most used experts in VRAM, the rest in RAM) or with experts on the CPU. It also picks the KV type and batch size."))
+                if autoMemoryPlan {
+                    LabeledContent(loc.t("Ejecución", "Execution")) {
+                        ToshDropdown(selection: $executionMode, options: [
+                            .init(value: "auto", title: loc.t("Auto", "Auto")),
+                            .init(value: "full", title: loc.t("GPU completa (manual)", "Full GPU (manual)")),
+                            .init(value: "dmoe", title: "Dynamic MoE"),
+                            .init(value: "legacy", title: loc.t("Expertos en CPU (clásico)", "Legacy offload"))
+                        ], width: 200)
+                    }
+                    .settingsGlyph("cpu")
+                    .infoTip(loc.t("Auto elige solo. GPU completa carga todo en la GPU aunque deje poco margen (para pruebas). Dynamic MoE lo fuerza en modelos MoE. Expertos en CPU usa el ajuste manual de ncmoe de abajo.",
+                                "Auto decides on its own. Full GPU loads everything on the GPU even with little headroom (for testing). Dynamic MoE forces it on MoE models. Legacy offload uses the manual ncmoe setting below."))
+                    LabeledContent(loc.t("KV cache", "KV cache")) {
+                        ToshDropdown(selection: $autoKVMode, options: [
+                            .init(value: "auto", title: loc.t("Auto", "Auto")),
+                            .init(value: "f16", title: "F16"),
+                            .init(value: "q8_0", title: "Q8"),
+                            .init(value: "turbo4", title: loc.t("Turbo4 (ahorro de memoria)", "Turbo4 (memory saver)"))
+                        ], width: 200)
+                    }
+                    .settingsGlyph("key")
+                    .infoTip(loc.t("Auto usa F16 y pasa a Q8 solo cuando libera memoria que de verdad importa (Q8 no cambia la calidad de forma medible). Turbo4 ahorra más memoria a cambio de algo de velocidad y calidad; nunca se elige solo.",
+                                "Auto uses F16 and moves to Q8 only when that frees memory that really matters (Q8 has no measurable quality cost). Turbo4 saves more memory at some speed and quality cost; it is never chosen automatically."))
+                }
+            }
+
             Section(loc.t("GPU y memoria", "GPU & memory")) {
                 LabeledContent(loc.t("GPU (Metal)", "GPU (Metal)")) {
                     ToshDropdown(selection: $gpuIndex, options: [.init(value: -1, title: loc.t("Predeterminada", "Default"))]
@@ -817,7 +851,8 @@ struct SettingsView: View {
                     .settingsGlyph("cpu")
                     .infoTip(loc.t("Solo modelos MoE: capas cuyos 'expertos' viven en RAM y los procesa el CPU. Se ajusta solo al elegir modelo; súbelo si la VRAM se satura, bájalo si te sobra. (Deshabilitado en modelos densos, donde el motor lo ignora.)",
                                 "MoE models only: layers whose 'experts' live in RAM and run on the CPU. Auto-set when picking a model; raise if VRAM saturates, lower if you have headroom. (Disabled on dense models, where the engine ignores it.)"))
-                    .disabled(!modelIsMoE || dynamicMoeIsEffective(settings: dynamicSettings))
+                    .disabled(!modelIsMoE || dynamicMoeIsEffective(settings: dynamicSettings)
+                              || (autoMemoryPlan && executionMode != "legacy"))
                 if engineSelection.wrappedValue != "custom" && dynamicMoeUIUnlocked {
                     Toggle(loc.t("Dynamic MoE (experimental)", "Dynamic MoE (experimental)"),
                            isOn: $dynamicMoe)

@@ -10,6 +10,7 @@ struct ServerOverviewView: View {
     var onDelete: (() -> Void)?
     @EnvironmentObject private var loc: Localizer
     @EnvironmentObject private var models: ModelStore
+    @EnvironmentObject private var vram: VRAMMonitor
     @AppStorage(SettingsKeys.modelPath) private var modelPath = ""
     @AppStorage(SettingsKeys.ctx) private var context = 16384
     @AppStorage(SettingsKeys.port) private var port = 8080
@@ -49,6 +50,39 @@ struct ServerOverviewView: View {
                 metric("square.stack.3d.up", value: name.quant.isEmpty ? "—" : name.quant, label: loc.t("Cuantización", "Quantization"))
                 Spacer(minLength: 0)
                 metric("cpu", value: ServerSettings.engineKind == "bundled" ? "llama.cpp" : loc.t("Personalizado", "Custom"), label: loc.t("Motor configurado", "Configured engine"))
+            }
+            if let plan = server.autoPlan {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(AutoMemoryText.summary(plan, runtime: server.autoRuntime), systemImage: "memorychip")
+                        .font(.callout)
+                        .help(loc.t("Por qué este modo: %@", "Why this mode: %@", AutoMemoryText.reason(plan)))
+                    if let note = server.autoPlanNote {
+                        Label(note, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    // the plan was made for the memory free at launch; an app opened later can take it back
+                    if server.state == .running, vram.totalMB > 0,
+                       vram.freeMB < 256 || vram.memoryUsedMB > 0.95*vram.memoryTotalMB {
+                        HStack(spacing: 8) {
+                            Label(loc.t("Otra aplicación está usando la memoria que reservó el plan; el rendimiento puede caer.",
+                                        "Another app is using the memory the plan set aside; performance may drop."),
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundStyle(.orange)
+                            Button(loc.t("Replanificar", "Replan")) {
+                                server.stop()
+                                Task {
+                                    for _ in 0..<40 where server.state != .stopped {
+                                        try? await Task.sleep(for: .milliseconds(250))
+                                    }
+                                    server.start(server.effectiveSettings())
+                                }
+                            }
+                            .controlSize(.small)
+                            .help(loc.t("Reinicia el servidor y vuelve a repartir la memoria que hay libre ahora.",
+                                        "Restarts the server and budgets the memory free now."))
+                        }
+                    }
+                }
             }
             Divider()
             HStack(spacing: 22) {
