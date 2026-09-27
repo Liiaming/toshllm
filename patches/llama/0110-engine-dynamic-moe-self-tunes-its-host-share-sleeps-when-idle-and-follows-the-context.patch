@@ -1,0 +1,955 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index e87fba28f..96c638e9e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -10,11 +10,20 @@
+ 
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
++#else
++static inline bool   tosh_dmoe_compact(void) { return false; }
++static inline float  tosh_dmoe_token_decay(void) { return 0.0f; }
++static inline void   tosh_dmoe_set_chunk_rows(const int32_t *, const float *, int) {}
++static inline void   tosh_dmoe_note_time(int, int64_t) {}
++static inline void   tosh_dmoe_timeline(int, int, double, double) {}
++static inline double tosh_dmoe_host_seconds(void) { return 0.0; }
++#endif
+ 
+ #include <assert.h>
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 53e763d54..4625122ca 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -250,10 +250,11 @@ struct ggml_metal {
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+     struct tosh_moe_cache * bounded_moe_cache;
+     // compact prefill uploads: bounded host ring, one command buffer per chunk
+     id<MTLBuffer>        dmoe_ring;
++    id<MTLBuffer>        dmoe_mark;
+     id<MTLCommandBuffer> dmoe_ring_cmds[8];
+     int                  dmoe_ring_cur;
+     int bounded_moe_layers;
+     int bounded_moe_experts;
+     int bounded_moe_slots;
+@@ -1104,10 +1105,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
+             [ctx->dmoe_ring_cmds[i] waitUntilCompleted];
+             [ctx->dmoe_ring_cmds[i] release];
+         }
+     }
+     [ctx->dmoe_ring release];
++    [ctx->dmoe_mark release];
+     tosh_moe_seen_dump();
+     tosh_moe_cache_free(ctx->bounded_moe_cache);
+     [ctx->bounded_moe_ids_readback release];
+     [ctx->bounded_moe_ids_remapped release];
+     [ctx->bounded_moe_expert_stage release];
+@@ -1503,10 +1505,30 @@ static bool ggml_metal_dmoe_compact_upload(ggml_metal_t ctx, const struct tosh_d
+         }
+         [encoder endEncoding];
+         ggml_metal_dmoe_submit(ctx, cmd_buf, plan->il);
+     }
+ 
++    // when the host runs rare experts, report when this layer's down bank is on the GPU: a read of
++    // the slot waits for every blit that wrote it
++    if (plan->which == 2 && tosh_dmoe_rare_rows_live() > 0) {
++        if (ctx->dmoe_mark == nil) {
++            ctx->dmoe_mark = [ggml_metal_device_get_obj(ctx->dev) newBufferWithLength:256 options:MTLResourceStorageModeShared];
++        }
++        id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
++        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++        [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs toBuffer:ctx->dmoe_mark destinationOffset:0 size:16];
++        [encoder endEncoding];
++        const int il = plan->il;
++        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++            tosh_dmoe_rare_dma_done(il, cb.GPUEndTime);
++        }];
++        [cmd_buf commit];
++        [ctx->cmd_bufs_ext addObject:cmd_buf];
++        ctx->cmd_buf_last = cmd_buf;
++        [cmd_buf retain];
++    }
++
+     atomic_fetch_add(&g_dmoe_pf_host_bytes, host_bytes);
+     atomic_fetch_add(&g_dmoe_pf_vram_bytes, vram_bytes);
+     atomic_fetch_add(&g_dmoe_pf_skip_bytes, skip_bytes);
+     for (int i = 0; i < 3; ++i) atomic_fetch_add(&g_dmoe_pf_rare_bytes[i], rare[i]);
+     atomic_fetch_add(&g_dmoe_pf_uploads, 1);
+@@ -4948,11 +4970,19 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+         if (max_tokens < 0) {
+             const char * s = TOSH_ENV("GGML_METAL_GRAPH_OPTIMIZE_MIN_BATCH");
+             max_tokens = s ? atoi(s) - 1 : 7;
+         }
+ 
+-        if (max_tokens < 0 || !ggml_metal_graph_is_moe_decode(gf, max_tokens)) {
++        // a wide batch whose rare experts run on the host is not reordered: moving nodes around its
++        // publish produced non-finite activations on small batches (32-63 tokens)
++        bool host_rows = false;
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++        for (int i = 0; i < gf->n_nodes && !host_rows; ++i) {
++            host_rows = gf->nodes[i]->op == GGML_OP_TOSH_DMOE_PUBLISH && ggml_get_op_params_i32(gf->nodes[i], 1) > 0;
++        }
++#endif
++        if (!host_rows && (max_tokens < 0 || !ggml_metal_graph_is_moe_decode(gf, max_tokens))) {
+             ggml_graph_optimize(gf);
+         }
+     }
+ 
+     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 18215685e..f49906e2e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -387,10 +387,11 @@ void *                      ggml_metal_device_dmoe_event(ggml_metal_device_t dev
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_stage(ggml_metal_device_t dev, size_t layer_stride);
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_tables(ggml_metal_device_t dev);
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_obs_ring(ggml_metal_device_t dev);
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_wide_stage(ggml_metal_device_t dev, size_t bytes);
+ size_t ggml_metal_private_bytes(void);
++void * ggml_metal_device_dmoe_reach_event(ggml_metal_device_t dev);
+ #endif
+ 
+ struct ggml_metal_fusion_info;
+ 
+ // the device-owned fusion debugging context (NULL unless fusion debugging is enabled)
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 874560b96..3b4ec9750 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1143,10 +1143,11 @@ struct ggml_metal_device {
+     size_t host_wrap_bytes;
+     NSLock * wrap_lock;
+ 
+     // mixed expert execution: one event and one host-visible stage, created on first use
+     id<MTLSharedEvent> dmoe_ev;
++    id<MTLSharedEvent> dmoe_reach;
+     id<MTLBuffer>      dmoe_stage;
+     NSLock *           dmoe_lock;
+     id<MTLBuffer>      dmoe_tables;
+     id<MTLBuffer>      dmoe_obs;
+     id<MTLBuffer>      dmoe_wide;
+@@ -1164,10 +1165,21 @@ void * ggml_metal_device_dmoe_event(ggml_metal_device_t dev) {
+     }
+     [dev->dmoe_lock unlock];
+     return dev->dmoe_ev;
+ }
+ 
++// signalled when a wide join is reached, before it waits on the host
++void * ggml_metal_device_dmoe_reach_event(ggml_metal_device_t dev) {
++    [dev->dmoe_lock lock];
++    if (dev->dmoe_reach == nil) {
++        dev->dmoe_reach = [dev->mtl_device newSharedEvent];
++        tosh_dmoe_set_reach_event(dev->dmoe_reach, ggml_metal_dmoe_ev_get);
++    }
++    [dev->dmoe_lock unlock];
++    return dev->dmoe_reach;
++}
++
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_obs_ring(ggml_metal_device_t dev) {
+     [dev->dmoe_lock lock];
+     if (dev->dmoe_obs == nil) {
+         dev->dmoe_obs = [dev->mtl_device newBufferWithLength:TOSH_DMOE_OBS_RING_BYTES options:MTLResourceStorageModeShared];
+         if (dev->dmoe_obs != nil) {
+@@ -3340,10 +3352,13 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
+ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+     @autoreleasepool {
+         ggml_metal_device_rsets_rm(buf->dev, buf->rset);
+ 
+         for (int i = 0; i < buf->n_buffers; i++) {
++            if (!buf->is_shared && buf->owned && buf->buffers[i].metal != nil) {
++                atomic_fetch_sub(&g_metal_private_bytes, (size_t) [buf->buffers[i].metal length]);
++            }
+             [buf->buffers[i].metal release];
+         }
+ 
+         ggml_metal_buffer_rset_free(buf);
+     }
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 0a2eda01d..a7e624a0b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4330,10 +4330,13 @@ static int ggml_metal_op_tosh_dmoe_publish_wide(ggml_metal_op_t ctx, int idx) {
+     uint64_t value;
+     memcpy(&value, &op->op_params[2], sizeof(value));
+ 
+     tosh_dmoe_wide_args args = tosh_dmoe_wide_args_of(ids, n_embd, n_expert, ggml_get_op_params_i32(op, 1), cur->nb[1]);
+     args.tail = ggml_get_op_params_i32(op, 5);
++    if (const int live = tosh_dmoe_rare_rows_live(); live > 0) {
++        args.rows = live;
++    }
+ 
+     ggml_metal_buffer_id bid_res = ggml_metal_device_dmoe_tables(ctx->dev);
+     if (bid_res.metal != nullptr) {
+         bid_res.offs = ((size_t) ggml_get_op_params_i32(op, 4)*TOSH_DMOE_MAX_LAYERS + il)*res->ne[0]*sizeof(int32_t);
+     } else {
+@@ -4379,20 +4382,22 @@ static int ggml_metal_op_tosh_dmoe_join_wide(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_buffer_id bid_stage = ggml_metal_device_dmoe_wide_stage(ctx->dev, tosh_dmoe_wide_bytes(n_embd, n_used));
+ 
+     uint64_t value;
+     memcpy(&value, &ids->op_params[2], sizeof(value));
+ 
++    ggml_metal_encoder_event(ctx->enc, ctx->cmd_buf, ggml_metal_device_dmoe_reach_event(ctx->dev), value, true);
+     ggml_metal_encoder_event(ctx->enc, ctx->cmd_buf, ev, value + 1, false);
+     ggml_metal_op_concurrency_reset(ctx);
+ 
+     tosh_dmoe_wide_args args = tosh_dmoe_wide_args_of(ids, n_embd, ids->src[2]->ne[0], 0, 0);
+ 
+     auto pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_join_wide", "tosh_dmoe_join_wide", nullptr);
+ 
+     ggml_metal_encoder_t enc = ctx->enc;
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+     ggml_metal_encoder_set_buffer  (enc, bid_stage, 1);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 2);
+     ggml_metal_encoder_dispatch_threadgroups(enc, n_used*n_tokens, 1, 1, 128, 1, 1);
+     ggml_metal_op_concurrency_reset(ctx);
+ 
+@@ -4521,11 +4526,10 @@ int ggml_metal_op_tosh_dmoe_join(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    4);
+     ggml_metal_encoder_dispatch_threadgroups(enc, n_used*n_tokens, 1, 1, 128, 1, 1);
+ 
+     return 1;
+ }
+-#endif
+ 
+ int ggml_metal_op_tosh_dmoe_observe(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+     const ggml_tensor * ids = op->src[0];
+ 
+@@ -4551,10 +4555,11 @@ int ggml_metal_op_tosh_dmoe_observe(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, bid_ring, 2);
+     ggml_metal_encoder_dispatch_threadgroups(enc, args.n_tokens, 1, 1, 32, 1, 1);
+ 
+     return 1;
+ }
++#endif
+ 
+ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+     ggml_metal_library_t lib = ctx->lib;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index bccc78065..c4c58d07d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,8 +1,12 @@
+ #include "llama-context.h"
+ #include "llama-tosh-dmoe.h"
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
++#else
++static inline size_t tosh_dmoe_private_bytes(void) { return 0; }
++#endif
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
+@@ -520,11 +524,11 @@ llama_context::llama_context(
+         }
+ 
+         sched_reserve();
+ 
+         // an automatic expert arena takes what the card has left once this context is sized
+-        if (llama_tosh_dmoe_budget_pending()) {
++        if (llama_tosh_dmoe_budget_pending() || llama_tosh_dmoe_rebudget_possible()) {
+             size_t gpu_bytes = 0;
+             for (const auto & [buft, d] : memory_breakdown()) {
+                 ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                 if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && !ggml_backend_buft_is_host(buft)) {
+                     gpu_bytes += d.total();
+@@ -535,10 +539,11 @@ llama_context::llama_context(
+                 gpu_bytes = held;
+             }
+             llama_tosh_dmoe_budget(gpu_bytes);
+             sched_reserve();
+         }
++        llama_tosh_dmoe_context_opened();
+ 
+         if (!cparams.flash_attn) {
+             if (ggml_is_quantized(params.type_v)) {
+                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+             }
+@@ -555,10 +560,11 @@ llama_context::llama_context(
+         }
+     }
+ }
+ 
+ llama_context::~llama_context() {
++    llama_tosh_dmoe_context_closed();
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index da8d948ab..1eb058870 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -45,10 +45,13 @@ const llama_tosh_dmoe_layer * llama_tosh_dmoe_layer_of(const ggml_tensor * gate_
+ #ifndef TOSH_ENABLE_DYNAMIC_MOE
+ 
+ void llama_tosh_dmoe_init(std::vector<llama_layer> &, const llama_hparams &) {}
+ bool llama_tosh_dmoe_budget_pending() { return false; }
+ void llama_tosh_dmoe_budget(size_t) {}
++bool llama_tosh_dmoe_rebudget_possible() { return false; }
++void llama_tosh_dmoe_context_opened() {}
++void llama_tosh_dmoe_context_closed() {}
+ void llama_tosh_dmoe_shutdown() {}
+ bool llama_tosh_dmoe_observe_prefill() { return false; }
+ int  llama_tosh_dmoe_rare_rows() { return 0; }
+ int  llama_tosh_dmoe_rare_tail() { return 0; }
+ int  llama_tosh_dmoe_wide_min_tokens() { return 1 << 30; }
+@@ -103,10 +106,24 @@ struct executor {
+     std::atomic<uint64_t> gen{0};
+     std::atomic<int>      arrived{0};
+     std::atomic<uint64_t> barrier_gen{0};
+     std::atomic<bool>     stop{false};
+ 
++    // helpers spin while jobs come every few hundred microseconds (decode) and sleep otherwise
++    std::mutex              work_mutex;
++    std::condition_variable work_cv;
++    std::atomic<int>        sleepers{0};
++    int                     spin_us = 2000;
++
++    void kick() {
++        gen.fetch_add(1);
++        if (sleepers.load() > 0) {
++            std::lock_guard<std::mutex> lock(work_mutex);
++            work_cv.notify_all();
++        }
++    }
++
+     std::vector<std::thread> helpers;
+     std::thread leader;
+     std::thread watchdog;
+ 
+     // dynamic residency: what the last job routed, handed to the policy once the GPU is released
+@@ -191,15 +208,24 @@ struct executor {
+     }
+ 
+     void helper_main(int tid) {
+         uint64_t seen = 0;
+         while (!stop.load()) {
+-            if (!tosh_dmoe_wait_active(2000)) {
++            if (!tosh_dmoe_wait_active(1000000)) {
+                 continue;
+             }
+             uint64_t g;
+-            while ((g = gen.load(std::memory_order_acquire)) == seen && tosh_dmoe_is_active() && !stop.load()) {
++            const clk::time_point t0 = clk::now();
++            for (int n = 1; (g = gen.load()) == seen && tosh_dmoe_is_active() && !stop.load(); ++n) {
++                if ((n & 255) == 0 && us_since(t0) > spin_us) {
++                    std::unique_lock<std::mutex> lock(work_mutex);
++                    sleepers++;
++                    work_cv.wait_for(lock, std::chrono::milliseconds(50),
++                        [&] { return gen.load() != seen || !tosh_dmoe_is_active() || stop.load(); });
++                    sleepers--;
++                    continue;
++                }
+                 DMOE_PAUSE();
+             }
+             if (g == seen) {
+                 continue;
+             }
+@@ -209,10 +235,14 @@ struct executor {
+     }
+ 
+     // a wide batch: the positions the GPU skipped, grouped by expert so its weights stay in cache
+     bool job_wide(int il, const tosh_dmoe_job & jb) {
+         const double t0 = tosh_dmoe_host_seconds();
++        if (il <= wide_first_il) {
++            wide_first_il = il;
++            tosh_dmoe_rare_chunk(t0, jb.n_tokens);
++        }
+         size_t bytes = 0;
+         char * stage = (char *) tosh_dmoe_wide_stage(&bytes);
+         const int T = jb.n_tokens, nu = jb.n_used;
+         if (stage == nullptr || il >= (int) banks.size() || banks[il].gate == nullptr ||
+             jb.n_embd != n_embd || T > TOSH_DMOE_WIDE_MAX_TOKENS || nu <= 0 ||
+@@ -259,23 +289,25 @@ struct executor {
+                 }
+             }
+             wide = true;
+             next1.store(0, std::memory_order_relaxed);
+             next2.store(0, std::memory_order_relaxed);
+-            gen.fetch_add(1, std::memory_order_acq_rel);
++            kick();
+             run(0);
+             wide = false;
+         }
+         n_wide++;
+         n_wide_miss    += misses.size();
+         n_wide_experts += n_exp;
+         const double t1 = tosh_dmoe_host_seconds();
+         us_wide += (uint64_t) ((t1 - t0)*1e6);
+         tosh_dmoe_timeline(1, il, t0, t1);
++        tosh_dmoe_rare_host_done(il, t0, t1, tosh_dmoe_reach_get() >= jb.value);
+         return true;
+     }
+     std::vector<uint8_t> wide_seen;
++    int wide_first_il = 1 << 30;
+ 
+     // one layer: find the non-resident experts, compute them, answer the GPU
+     bool job(int il, const tosh_dmoe_job & jb) {
+         const clk::time_point t0 = clk::now();
+ 
+@@ -345,49 +377,64 @@ struct executor {
+             }
+             us_quant += (uint64_t) us_since(tq);
+ 
+             next1.store(0, std::memory_order_relaxed);
+             next2.store(0, std::memory_order_relaxed);
+-            gen.fetch_add(1, std::memory_order_acq_rel);
++            kick();
+             run(0);
+         }
+ 
+         n_jobs++;
+         us_job += (uint64_t) us_since(t0);
+         return true;
+     }
+ 
+     void leader_main() {
+         uint64_t answered = 0;
++        clk::time_point last = clk::now();
++        bool was_active = false;
+         while (!stop.load()) {
+-            if (!tosh_dmoe_wait_active(2000)) {
++            if (!tosh_dmoe_wait_active(1000000)) {
++                was_active = false;
+                 continue;
+             }
++            if (!was_active) {
++                was_active = true;
++                last = clk::now();
++            }
+             const uint64_t v = tosh_dmoe_event_get();
+             if (v == answered || v % 2 == 0) {
+-                DMOE_PAUSE();
++                // a wide layer takes tens of milliseconds: past the decode cadence, poll gently
++                if (us_since(last) > spin_us) {
++                    std::this_thread::sleep_for(std::chrono::microseconds(100));
++                } else {
++                    DMOE_PAUSE();
++                }
+                 continue;
+             }
++            last = clk::now();
+             const tosh_dmoe_job * jb = tosh_dmoe_job_of(v);
+             obs_n = 0;
+             if (tosh_dmoe_failed() == nullptr) {
+                 if (__atomic_load_n(&jb->value, __ATOMIC_ACQUIRE) != v) {
+                     tosh_dmoe_fail("the published value does not match its job");
+                 } else {
+                     try {
+                         if (jb->n_tokens > TOSH_DMOE_MAX_TOKENS) {
+                             job_wide(jb->il, *jb);
+                         } else {
++                            tosh_dmoe_rare_interrupt();
+                             job(jb->il, *jb);
+                         }
+                     } catch (...) {
+                         tosh_dmoe_fail("the host executor threw");
+                     }
+                 }
+             }
+             answered = v;
+             tosh_dmoe_event_set(v + 1);
++            last = clk::now();
+             if (obs_n > 0 && jb->n_tokens <= TOSH_DMOE_MAX_TOKENS) {
+                 observe(observe_ctx, jb->il, obs_ids, obs_slots, obs_n, jb->n_tokens > 1, jb->tick);
+             }
+         }
+     }
+@@ -395,11 +442,11 @@ struct executor {
+     // answers a publish nobody answered, so the GPU cannot wait forever
+     void watchdog_main() {
+         uint64_t last = 0;
+         clk::time_point since = clk::now();
+         while (!stop.load()) {
+-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+             const uint64_t v = tosh_dmoe_event_get();
+             const bool pending = tosh_dmoe_is_active() && (v % 2 == 1);
+             if (!pending || v != last) {
+                 last  = v;
+                 since = clk::now();
+@@ -568,10 +615,11 @@ struct policy {
+     std::atomic<bool> stop{false};
+ 
+     // stats
+     std::atomic<uint64_t> dropped{0};
+     uint64_t n_cycles = 0, promotions = 0, evictions = 0, repromotions = 0, failed = 0, publishes = 0;
++    uint32_t last_stats = 0;
+     uint64_t bytes_promoted = 0, upload_done = 0, verified = 0, verify_bad = 0, stale_hits = 0;
+     double   us_cycle = 0, us_drain = 0, us_decide = 0, us_publish = 0, us_upload_call = 0;
+     double   us_upload_wall = 0, us_upload_gpu = 0;
+     uint64_t lifetime_sum = 0, lifetime_n = 0, uses_sum = 0;
+     std::vector<uint32_t> lifetimes;
+@@ -629,10 +677,26 @@ struct policy {
+         const clk::time_point t0 = clk::now();
+         const uint64_t sync = tosh_dmoe_completed_value();
+         const uint32_t now  = (uint32_t) tosh_dmoe_tick();
+         n_cycles++;
+ 
++        // TOSH_DMOE_STATS_EVERY=<graphs>: a running line for long sessions
++        static const uint32_t every = getenv("TOSH_DMOE_STATS_EVERY") ? (uint32_t) atoi(getenv("TOSH_DMOE_STATS_EVERY")) : 0;
++        if (every > 0 && now >= last_stats + every) {
++            last_stats = now;
++            int res = 0, pend = 0, ret = 0, pre = 0;
++            for (const slot & sl : slots) {
++                res  += sl.state == RESIDENT;
++                pend += sl.state == PENDING;
++                ret  += sl.state == RETIRING;
++                pre  += sl.state == PREFILL;
++            }
++            fprintf(stderr, "tosh_dmoe: graph %u | slots resident %d pending %d retiring %d prefill %d | promotions %llu evictions %llu re-promotions %llu | changed-slot hits %llu, failed %llu\n",
++                    now, res, pend, ret, pre, (unsigned long long) promotions, (unsigned long long) evictions,
++                    (unsigned long long) repromotions, (unsigned long long) stale_hits, (unsigned long long) failed);
++        }
++
+         // 1. observations since the last cycle
+         std::vector<std::pair<float, size_t>> cands;
+         for (int il = 0; il < n_layer; ++il) {
+             if (layers[il] == nullptr) continue;
+             const uint32_t h = head[il].load(std::memory_order_acquire);
+@@ -971,11 +1035,13 @@ struct policy {
+     }
+ 
+     void main() {
+         uint64_t seen = tosh_dmoe_completed_value();
+         while (!stop.load()) {
+-            tosh_dmoe_wait_completed(seen, 2000);
++            // uploads in flight are polled; with nothing moving only a finished graph brings work
++            const bool moving = !pending_slots.empty() || !prefill_slots.empty() || !retiring_slots.empty();
++            tosh_dmoe_wait_completed(seen, moving ? 2000 : 500000);
+             seen = tosh_dmoe_completed_value();
+             try {
+                 cycle();
+             } catch (...) {
+                 tosh_dmoe_fail("the residency policy threw");
+@@ -1050,10 +1116,11 @@ static bool dmoe_bank_plan(const void * host, size_t size, tosh_dmoe_bank_plan *
+     }
+     plan->arena        = r.which == 0 ? dl->arena_gate : r.which == 1 ? dl->arena_up : dl->arena_down;
+     plan->n_expert     = g_n_expert;
+     plan->expert_bytes = r.bank->nb[2];
+     plan->il           = r.il;
++    plan->which        = r.which;
+     plan->promo_expert = nullptr;
+     plan->promo_slot   = nullptr;
+     plan->n_promo      = 0;
+     int n_rows = 0;
+     plan->rows = tosh_dmoe_chunk_rows(&n_rows);
+@@ -1144,11 +1211,19 @@ static void dmoe_report_at_exit() {
+ }
+ 
+ }
+ 
+ int llama_tosh_dmoe_rare_rows() {
+-    static const int rows = getenv("TOSH_DMOE_RARE_ROWS") ? atoi(getenv("TOSH_DMOE_RARE_ROWS")) : 0;
++    // a number fixes the threshold; auto starts low and lets the controller move it
++    static const int rows = [] {
++        const char * v = getenv("TOSH_DMOE_RARE_ROWS");
++        if (v == nullptr) return 0;
++        const bool adapt = strcmp(v, "auto") == 0;
++        const int r = adapt ? 4 : atoi(v);
++        tosh_dmoe_rare_rows_init(r, 24, adapt);
++        return r;
++    }();
+     return g_exec != nullptr && tosh_dmoe_compact() ? rows : 0;
+ }
+ 
+ int llama_tosh_dmoe_rare_tail() {
+     static const int n = getenv("TOSH_DMOE_RARE_TAIL") ? atoi(getenv("TOSH_DMOE_RARE_TAIL")) : 32;
+@@ -1174,13 +1249,20 @@ void llama_tosh_dmoe_shutdown() {
+         g_policy->stop = true;
+         g_policy->th.join();
+     }
+     if (g_exec != nullptr) {
+         g_exec->stop = true;
++        // idle workers sleep until the executor turns active: wake them to see the stop
++        tosh_dmoe_set_active(true);
++        {
++            std::lock_guard<std::mutex> lock(g_exec->work_mutex);
++            g_exec->work_cv.notify_all();
++        }
+         for (auto & t : g_exec->helpers) if (t.joinable()) t.join();
+         if (g_exec->leader.joinable())   g_exec->leader.join();
+         if (g_exec->watchdog.joinable()) g_exec->watchdog.join();
++        tosh_dmoe_set_active(false);
+     }
+     // the stats stay for the exit report; the arena and the layer map go with the model
+     g_layers.clear();
+     if (g_arena_buf != nullptr) {
+         ggml_backend_buffer_free(g_arena_buf);
+@@ -1188,10 +1270,27 @@ void llama_tosh_dmoe_shutdown() {
+     }
+ }
+ 
+ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams, const char * path, double cache_mib);
+ 
++// A cache size is a request, not a requirement: a model or budget it cannot serve keeps running
++// without mixed execution. A residency file is a test setup and still fails the load.
++static void dmoe_init_or_off(std::vector<llama_layer> & layers, const llama_hparams & hparams, const char * path, double cache_mib) {
++    if (path != nullptr) {
++        dmoe_init(layers, hparams, path, cache_mib);
++        return;
++    }
++    try {
++        dmoe_init(layers, hparams, path, cache_mib);
++    } catch (const std::exception & err) {
++        LLAMA_LOG_WARN("%s: mixed expert execution stays off: %s\n", __func__, err.what());
++        llama_tosh_dmoe_shutdown();
++        delete g_policy;
++        g_policy = nullptr;
++    }
++}
++
+ // TOSH_DMOE_CACHE_MIB=auto: the arena waits for the context, so it is what the card has left
+ static std::vector<llama_layer> * g_defer_layers = nullptr;
+ static const llama_hparams *      g_defer_hparams = nullptr;
+ 
+ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams) {
+@@ -1203,21 +1302,59 @@ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams
+     if (path == nullptr && strcmp(cache_mib, "auto") == 0) {
+         g_defer_layers  = &layers;
+         g_defer_hparams = &hparams;
+         return;
+     }
+-    dmoe_init(layers, hparams, path, cache_mib ? atof(cache_mib) : 0.0);
++    dmoe_init_or_off(layers, hparams, path, cache_mib ? atof(cache_mib) : 0.0);
+ }
+ 
+ bool llama_tosh_dmoe_budget_pending() {
+     return g_defer_layers != nullptr && g_exec == nullptr;
+ }
+ 
++// an automatic arena is sized again when a context with another footprint is created alone
++static std::vector<llama_layer> * g_auto_layers  = nullptr;
++static const llama_hparams *      g_auto_hparams = nullptr;
++static int                        g_contexts     = 0;
++
++void llama_tosh_dmoe_context_opened() { g_contexts++; }
++void llama_tosh_dmoe_context_closed() { g_contexts--; }
++
++bool llama_tosh_dmoe_rebudget_possible() {
++    return g_auto_layers != nullptr && g_contexts == 0;
++}
++
++// Drops the running policy, executor and arena once nothing can use them: no context is alive,
++// and uploads still in flight into the arena are waited for.
++static void dmoe_teardown() {
++    if (g_policy != nullptr) {
++        g_policy->stop = true;
++        if (g_policy->th.joinable()) g_policy->th.join();
++        for (const int gs : g_policy->pending_slots) {
++            const auto & sl = g_policy->slots[gs];
++            for (int i = 0; i < 1000 && g_policy->up->status(g_policy->up->ctx, sl.ticket) == 0; ++i) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++        }
++    }
++    llama_tosh_dmoe_shutdown();
++    delete g_policy;
++    g_policy = nullptr;
++    delete g_exec;
++    g_exec = nullptr;
++}
++
+ void llama_tosh_dmoe_budget(size_t gpu_bytes) {
+-    std::vector<llama_layer> & layers = *g_defer_layers;
+-    const llama_hparams & hparams = *g_defer_hparams;
++    const bool first = g_defer_layers != nullptr;
++    std::vector<llama_layer> & layers = first ? *g_defer_layers : *g_auto_layers;
++    const llama_hparams & hparams = first ? *g_defer_hparams : *g_auto_hparams;
+     g_defer_layers = nullptr;
++    g_auto_layers  = &layers;
++    g_auto_hparams = &hparams;
++    // the running arena is part of what the backend holds, not of what this context needs
++    const size_t arena_now = g_arena_buf ? ggml_backend_buffer_get_size(g_arena_buf) : 0;
++    gpu_bytes -= std::min(gpu_bytes, arena_now);
+ 
+     auto envmib = [](const char * k, double d) { const char * v = getenv(k); return (v ? atof(v) : d)*1048576.0; };
+     size_t free0 = 0, total = 0;
+     tosh_dmoe_vram(&free0, &total);
+     // the bank uploads of prefill take three slots the size of the largest host bank
+@@ -1233,15 +1370,29 @@ void llama_tosh_dmoe_budget(size_t gpu_bytes) {
+     const double arena    = (double) free0 - reserve - overhead - prefetch - (double) gpu_bytes;
+     const double M = 1048576.0;
+     LLAMA_LOG_INFO("%s: VRAM free at start %.0f MiB of %.0f; model, context and compute %.0f, prefill slots %.0f, "
+                    "reserve %.0f, overhead %.0f -> expert arena %.0f MiB\n", __func__, free0/M, total/M, gpu_bytes/M,
+                    prefetch/M, reserve/M, overhead/M, std::max(0.0, arena)/M);
++    if (!first) {
++        const double delta = arena - (double) arena_now;
++        if (fabs(delta) < 256.0*M) {
++            return;
++        }
++        const auto t0 = clk::now();
++        dmoe_teardown();
++        if (arena >= 256.0*M) {
++            dmoe_init_or_off(layers, hparams, nullptr, arena/M);
++        }
++        LLAMA_LOG_INFO("%s: expert arena rebuilt for this context, %.0f -> %.0f MiB in %.1f ms\n", __func__,
++                       arena_now/M, std::max(0.0, arena)/M, std::chrono::duration<double, std::milli>(clk::now() - t0).count());
++        return;
++    }
+     if (arena < 256.0*M) {
+         LLAMA_LOG_WARN("%s: under 256 MiB left for experts, mixed execution stays off\n", __func__);
+         return;
+     }
+-    dmoe_init(layers, hparams, nullptr, arena/M);
++    dmoe_init_or_off(layers, hparams, nullptr, arena/M);
+ }
+ 
+ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams, const char * path, double cache_mib) {
+     // a residency file pins the set; a cache size lets the policy fill it online
+     const bool dynamic = path == nullptr;
+@@ -1291,11 +1442,15 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+     if (gpu == nullptr) {
+         throw std::runtime_error("TOSH_DMOE_RESIDENCY: no GPU device");
+     }
+     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(gpu);
+ 
+-    auto * ex = new executor();
++    std::unique_ptr<executor> ex_owner(new executor());
++    auto * ex = ex_owner.get();
++    if (const char * v = getenv("TOSH_DMOE_SPIN_US")) {
++        ex->spin_us = atoi(v);
++    }
+     ex->banks.resize(n_layer);
+ 
+     ggml_init_params ip = { ggml_tensor_overhead()*(size_t) n_layer*4 + 1024, nullptr, true };
+     ggml_context * ctx = ggml_init(ip);
+ 
+@@ -1371,14 +1526,21 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+     }
+ 
+     if (dynamic) {
+         const size_t page = 16384;
+         const size_t bytes = ((size_t) TOSH_DMOE_VERSIONS*TOSH_DMOE_MAX_LAYERS*n_expert*sizeof(int32_t) + page - 1)/page*page;
+-        void * tb = nullptr;
+-        if (posix_memalign(&tb, page, bytes) != 0) {
++        // kept across arena rebuilds: the GPU backend wraps these pages once
++        static void * tb_kept = nullptr;
++        static size_t tb_bytes = 0;
++        void * tb = bytes <= tb_bytes ? tb_kept : nullptr;
++        if (tb == nullptr && posix_memalign(&tb, page, bytes) != 0) {
+             throw std::runtime_error("TOSH_DMOE_CACHE_MIB: cannot allocate the residency tables");
+         }
++        if (tb != tb_kept) {
++            tb_kept = tb;
++            tb_bytes = bytes;
++        }
+         memset(tb, 0xff, bytes);
+         tosh_dmoe_set_tables((int32_t *) tb, bytes, TOSH_DMOE_MAX_LAYERS, n_expert);
+         tosh_dmoe_publish_version(0);
+ 
+         auto * pol = new policy();
+@@ -1448,13 +1610,17 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+     }
+     if (getenv("TOSH_DMOE_PREFILL_ARENA") == nullptr || atoi(getenv("TOSH_DMOE_PREFILL_ARENA")) != 0) {
+         tosh_dmoe_set_bank_planner(dmoe_bank_plan);
+     }
+ 
+-    g_exec = ex;
++    g_exec = ex_owner.release();
+     ex->start();
+-    atexit(dmoe_report_at_exit);
++    static bool reported = false;
++    if (!reported) {
++        reported = true;
++        atexit(dmoe_report_at_exit);
++    }
+ 
+     LLAMA_LOG_INFO("%s: mixed expert execution on %zu layers, %zu resident experts, VRAM arena %.2f MiB, %d host threads\n",
+             __func__, made.size(), n_resident, ggml_backend_buffer_get_size(buf)/1048576.0, ex->n_threads);
+ }
+ 
+diff --git a/src/llama-tosh-dmoe.h b/src/llama-tosh-dmoe.h
+index ac9efe4b8..9d88b349c 100644
+--- a/src/llama-tosh-dmoe.h
++++ b/src/llama-tosh-dmoe.h
+@@ -35,10 +35,14 @@ int llama_tosh_dmoe_wide_min_tokens();
+ 
+ // TOSH_DMOE_CACHE_MIB=auto defers the arena until a context knows its own VRAM: the arena is
+ // what remains of the card after it, the prefill slots and a reserve (TOSH_DMOE_RESERVE_MIB).
+ bool llama_tosh_dmoe_budget_pending();
+ void llama_tosh_dmoe_budget(size_t gpu_bytes);
++// A context created while no other is alive may resize an automatic arena; contexts are counted.
++bool llama_tosh_dmoe_rebudget_possible();
++void llama_tosh_dmoe_context_opened();
++void llama_tosh_dmoe_context_closed();
+ 
+ // Stops the host executor and the residency policy before the model's buffers go away.
+ void llama_tosh_dmoe_shutdown();
+ 
+ // The mixed-execution state for the layer whose gate bank is `gate_exps`, or null.
+diff --git a/tosh-moe/tosh-dmoe.cpp b/tosh-moe/tosh-dmoe.cpp
+index 995969916..029db1308 100644
+--- a/tosh-moe/tosh-dmoe.cpp
++++ b/tosh-moe/tosh-dmoe.cpp
+@@ -154,10 +154,114 @@ size_t tosh_dmoe_private_bytes(void) { return g_private_query ? g_private_query(
+ bool tosh_dmoe_vram(size_t * free_at_start, size_t * total) {
+     *free_at_start = g_vram_free; *total = g_vram_total;
+     return g_vram_total > 0;
+ }
+ 
++namespace {
++struct rare_ctl {
++    std::mutex m;
++    std::atomic<int> rows{0};
++    int  max_rows = 8;
++    bool adapt = false;
++    struct layer { uint64_t host_seq = 0, dma_seq = 0; double dma_end[8] = {}; };
++    std::vector<layer> layers = std::vector<layer>(TOSH_DMOE_MAX_LAYERS);
++    int n = 0, n_late = 0;
++    double late_s = 0;
++    double prev_start = -1;
++    int    prev_tokens = 0;
++    double host_s = 0;              // host time of the chunk in progress
++    double share = -1;              // smoothed host share of a chunk
++    double target = 0.50;
++    double waited = -1;                 // smoothed share of layers whose join waited on the host
++    int    n_decode = 0;                // decode jobs since the last chunk
++    int    n_wait = 0;                  // layers whose join was already waiting when the host finished
++};
++rare_ctl g_rare;
++}
++
++void tosh_dmoe_rare_rows_init(int rows, int max_rows, bool adapt) {
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    g_rare.rows = rows; g_rare.max_rows = max_rows; g_rare.adapt = adapt;
++    if (const char * t = getenv("TOSH_DMOE_RARE_TARGET")) g_rare.target = atof(t);
++}
++int tosh_dmoe_rare_rows_live(void) { return g_rare.rows.load(std::memory_order_relaxed); }
++
++void tosh_dmoe_rare_dma_done(int il, double t_end) {
++    if (il < 0 || il >= TOSH_DMOE_MAX_LAYERS) return;
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    auto & L = g_rare.layers[il];
++    L.dma_end[L.dma_seq % 8] = t_end;
++    L.dma_seq++;
++}
++
++static void * g_reach_ev = nullptr;
++static uint64_t (*g_reach_get)(void *) = nullptr;
++void tosh_dmoe_set_reach_event(void * ev, uint64_t (*get)(void *)) { g_reach_ev = ev; g_reach_get = get; }
++uint64_t tosh_dmoe_reach_get(void) { return g_reach_get ? g_reach_get(g_reach_ev) : 0; }
++
++void tosh_dmoe_rare_host_done(int il, double t_start, double t_end, bool gpu_waiting) {
++    if (il < 0 || il >= TOSH_DMOE_MAX_LAYERS) return;
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    g_rare.host_s += t_end - t_start;
++    g_rare.n_wait += gpu_waiting;
++    auto & L = g_rare.layers[il];
++    const uint64_t h = L.host_seq++;
++    // the chunk's down bank already landed: the join waits on the host from here
++    if (L.dma_seq > h && L.dma_seq - h <= 8) {
++        g_rare.n_late++;
++        g_rare.late_s += t_end - L.dma_end[h % 8];
++    }
++    g_rare.n++;
++}
++
++void tosh_dmoe_rare_interrupt(void) {
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    g_rare.n_decode++;
++}
++
++void tosh_dmoe_rare_chunk(double t_start, int n_tokens) {
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    // a model that narrows its last layer to the output rows runs one decode job per chunk; more
++    // than a few means decode ran in between and the period is not a measurement
++    const double prev = g_rare.n_decode > 8 ? -1.0 : g_rare.prev_start;
++    const int    prev_tokens = g_rare.prev_tokens;
++    g_rare.prev_start  = t_start;
++    g_rare.prev_tokens = n_tokens;
++    g_rare.n_decode    = 0;
++    if (prev < 0) {
++        g_rare.host_s = 0;
++        g_rare.n_wait = 0;
++        g_rare.n = 0;
++    }
++    // a gap longer than a chunk is decode or idle in between, not a measurement
++    if (prev < 0 || prev_tokens <= 0 || t_start - prev > 5.0) {
++        return;
++    }
++    const double share = g_rare.host_s/(t_start - prev);
++    g_rare.host_s = 0;
++    g_rare.share = g_rare.share < 0 ? share : 0.5*g_rare.share + 0.5*share;
++    if (g_rare.n > 0) {
++        const double w = (double) g_rare.n_wait/g_rare.n;
++        g_rare.waited = g_rare.waited < 0 ? w : 0.5*g_rare.waited + 0.5*w;
++    }
++    int r = g_rare.rows.load();
++    const int was = r;
++    if (g_rare.adapt && g_rare.waited >= 0) {
++        // two rows at a time while far from the target, so a short prompt still gets there
++        const int step = g_rare.waited < 0.10 || g_rare.waited > 0.90 ? 2 : 1;
++        if (g_rare.waited < g_rare.target - 0.15) r = std::min(r + step, g_rare.max_rows);
++        else if (g_rare.waited > g_rare.target + 0.15) r = std::max(r - step, 1);
++    }
++    if (getenv("TOSH_DMOE_STATS")) {
++        fprintf(stderr, "tosh_dmoe: rare-row threshold %d -> %d (host share %.2f, %.3f ms per token; join waited in %d of %d layers, %d finished after their down bank)\n",
++                was, r, g_rare.share, (t_start - prev)/prev_tokens*1e3, g_rare.n_wait, g_rare.n, g_rare.n_late);
++    }
++    g_rare.n_wait = 0;
++    g_rare.rows = r;
++    g_rare.n = 0; g_rare.n_late = 0; g_rare.late_s = 0;
++}
++
+ bool tosh_dmoe_compact(void) {
+     static const bool on = getenv("TOSH_DMOE_COMPACT") == nullptr || atoi(getenv("TOSH_DMOE_COMPACT")) != 0;
+     return on && tosh_dmoe_enabled();
+ }
+ static const int32_t * g_chunk_rows = nullptr;
+diff --git a/tosh-moe/tosh-dmoe.h b/tosh-moe/tosh-dmoe.h
+index 9ab25ff8a..c3c298335 100644
+--- a/tosh-moe/tosh-dmoe.h
++++ b/tosh-moe/tosh-dmoe.h
+@@ -55,10 +55,24 @@ static inline size_t tosh_dmoe_wide_bytes(int n_embd, int n_used) {
+     return tosh_dmoe_wide_off_out(TOSH_DMOE_WIDE_MAX_TOKENS, n_embd, n_used) + (size_t) TOSH_DMOE_WIDE_MAX_ROWS*n_embd*4;
+ }
+ void   tosh_dmoe_set_wide_stage(void * host, size_t bytes);
+ void * tosh_dmoe_wide_stage(size_t * bytes);
+ 
++// Rare-row threshold the next wide publish uses. With adapt, it moves one row at a time to keep
++// the share of layers whose join is already waiting when the host finishes near a target
++// (TOSH_DMOE_RARE_TARGET): a short wait means the host took rows the uploads no longer carry.
++void tosh_dmoe_rare_rows_init(int rows, int max_rows, bool adapt);
++int  tosh_dmoe_rare_rows_live(void);
++void tosh_dmoe_rare_host_done(int il, double t_start, double t_end, bool gpu_waiting);
++// the GPU signals this event with a wide layer's publish value when it reaches that layer's join
++void     tosh_dmoe_set_reach_event(void * ev, uint64_t (*get)(void *));
++uint64_t tosh_dmoe_reach_get(void);
++void tosh_dmoe_rare_dma_done(int il, double t_end);
++void tosh_dmoe_rare_chunk(double t_start, int n_tokens);
++// a decode step ran: the next chunk's period would include it, so it is not a measurement
++void tosh_dmoe_rare_interrupt(void);
++
+ // Prefill timeline for overlap studies (TOSH_DMOE_TIMELINE=<file>): kind, layer, host seconds.
+ void tosh_dmoe_timeline(int kind, int il, double t0, double t1);
+ double tosh_dmoe_host_seconds(void);
+ 
+ // Free VRAM before this process allocated anything, and the card's total, as the driver sees them.
+@@ -138,10 +152,11 @@ struct tosh_dmoe_bank_plan {
+     const int32_t * promo_slot;
+     int             n_promo;
+     // rows per expert of the chunk being uploaded, or null to carry the whole bank
+     const int32_t * rows;
+     int             il;
++    int             which;          // 0 gate, 1 up, 2 down
+ };
+ typedef bool (*tosh_dmoe_bank_plan_fn)(const void * host, size_t size, struct tosh_dmoe_bank_plan * plan);
+ void tosh_dmoe_set_bank_planner(tosh_dmoe_bank_plan_fn fn);
+ bool tosh_dmoe_bank_planner(const void * host, size_t size, struct tosh_dmoe_bank_plan * plan);
+ 
