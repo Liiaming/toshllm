@@ -1,0 +1,900 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 6ab7cceec..bcc8cc7a6 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -10,10 +10,11 @@
+ 
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
++#include "tosh-dmoe.h"
+ 
+ #include <assert.h>
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -1771,10 +1772,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
++    std::vector<int32_t> chunk_ids;
++    std::vector<int32_t> chunk_rows;
++    std::vector<float>   chunk_tail;
++    ggml_tensor * chunk_rows_ids = nullptr;
+ 
+     int prev_backend_id = -1;
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+@@ -1852,12 +1857,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                         ggml_backend_buffer_is_host(input->buffer) &&
+                         node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
+                         const ggml_tensor * ids = node->src[2];
+                         const int64_t n_expert = input->ne[2];
+-                        if (ids->ne[0]*ids->ne[1] >= 2*n_expert &&
++                        const bool compact = tosh_dmoe_compact();
++                        if ((compact || ids->ne[0]*ids->ne[1] >= 2*n_expert) &&
+                             ggml_backend_sched_prefetch_init(sched, split_backend, ggml_nbytes(input))) {
++                            if (compact) {
++                                // the chunk's routing decides which experts the upload carries
++                                ggml_tensor * ids_tensor = node->src[2];
++                                ggml_backend_t ids_backend = split_backend;
++                                for (int i = input_id + 1; i < split->n_inputs; i++) {
++                                    if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
++                                        ids_tensor = split->inputs[i];
++                                        ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
++                                        break;
++                                    }
++                                }
++                                if (ids_tensor != chunk_rows_ids) {
++                                    const int64_t t_wait = ggml_time_us();
++                                    chunk_ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
++                                    ggml_backend_tensor_get_async(ids_backend, ids_tensor, chunk_ids.data(), 0, ggml_nbytes(ids_tensor));
++                                    ggml_backend_synchronize(ids_backend);
++                                    const int64_t t_count = ggml_time_us();
++                                    tosh_dmoe_note_time(0, t_count - t_wait);
++                                    chunk_rows.assign(n_expert, 0);
++                                    chunk_tail.assign(n_expert, 0.0f);
++                                    const float decay = tosh_dmoe_token_decay();
++                                    float w = 1.0f;
++                                    for (int64_t i1 = ids_tensor->ne[1] - 1; i1 >= 0; i1--, w *= decay) {
++                                        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
++                                            const int32_t id = chunk_ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
++                                            GGML_ASSERT(id >= 0 && id < n_expert);
++                                            chunk_rows[id]++;
++                                            chunk_tail[id] += w;
++                                        }
++                                    }
++                                    chunk_rows_ids = ids_tensor;
++                                    tosh_dmoe_note_time(3, ggml_time_us() - t_count);
++                                }
++                                tosh_dmoe_set_chunk_rows(chunk_rows.data(), chunk_tail.data(), (int) n_expert);
++                            }
+                             const int slot = sched->prefetch_cur;
+                             sched->prefetch_cur = (sched->prefetch_cur + 1) % sched->prefetch_n_slots;
+                             // wait for the previous user of this slot to finish computing
+                             if (sched->prefetch_used[slot]) {
+                                 ggml_backend_event_wait(sched->prefetch_backend, sched->prefetch_free[slot]);
+@@ -1868,11 +1909,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             prefetch_input_cpy    = input_cpy;
+                             prefetch_saved_buffer = input_cpy->buffer;
+                             prefetch_saved_data   = input_cpy->data;
+                             input_cpy->buffer = sched->prefetch_slots[slot];
+                             input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
++                            const int64_t t_up = compact ? ggml_time_us() : 0;
+                             ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++                            if (compact) {
++                                tosh_dmoe_set_chunk_rows(nullptr, nullptr, 0);
++                                tosh_dmoe_note_time(1, ggml_time_us() - t_up);
++                            }
+                             ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
+                             ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
+                             split_prefetch_slot = slot;
+                             continue;
+                         }
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e2b594201..c39fa8fc5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -248,10 +248,14 @@ struct ggml_metal {
+     int prefetch_stage_count;
+     int prefetch_stage_cur;
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+     struct tosh_moe_cache * bounded_moe_cache;
++    // compact prefill uploads: bounded host ring, one command buffer per chunk
++    id<MTLBuffer>        dmoe_ring;
++    id<MTLCommandBuffer> dmoe_ring_cmds[8];
++    int                  dmoe_ring_cur;
+     int bounded_moe_layers;
+     int bounded_moe_experts;
+     int bounded_moe_slots;
+     int bounded_moe_fixed;
+     id<MTLBuffer> bounded_moe_ids_readback;
+@@ -1093,10 +1097,17 @@ void ggml_metal_free(ggml_metal_t ctx) {
+         }
+         [ctx->prefetch_stages[i] release];
+     }
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
++    for (int i = 0; i < 8; ++i) {
++        if (ctx->dmoe_ring_cmds[i]) {
++            [ctx->dmoe_ring_cmds[i] waitUntilCompleted];
++            [ctx->dmoe_ring_cmds[i] release];
++        }
++    }
++    [ctx->dmoe_ring release];
+     tosh_moe_seen_dump();
+     tosh_moe_cache_free(ctx->bounded_moe_cache);
+     [ctx->bounded_moe_ids_readback release];
+     [ctx->bounded_moe_ids_remapped release];
+     [ctx->bounded_moe_expert_stage release];
+@@ -1324,19 +1335,184 @@ void ggml_metal_read_batch_end(ggml_metal_t ctx) {
+ }
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ static _Atomic uint64_t g_dmoe_pf_host_bytes;
+ static _Atomic uint64_t g_dmoe_pf_vram_bytes;
++static _Atomic uint64_t g_dmoe_pf_skip_bytes;
++static _Atomic uint64_t g_dmoe_pf_rare_bytes[3];
++static _Atomic uint64_t g_dmoe_pf_uploads;
++static _Atomic uint64_t g_dmoe_pf_used;
++static _Atomic uint64_t g_dmoe_pf_used_res;
+ 
+ static void ggml_metal_dmoe_pf_report(void) {
+     const uint64_t h = atomic_load(&g_dmoe_pf_host_bytes), v = atomic_load(&g_dmoe_pf_vram_bytes);
+     if (h + v > 0 && getenv("TOSH_DMOE_STATS")) {
+-        fprintf(stderr, "tosh_dmoe: prefill bank uploads %.2f GiB from host, %.2f GiB from the VRAM arena\n",
+-                h/1073741824.0, v/1073741824.0);
++        const double G = 1073741824.0;
++        fprintf(stderr, "tosh_dmoe: prefill bank uploads %.2f GiB from host, %.2f GiB from the VRAM arena, %.2f GiB not routed and skipped\n",
++                h/G, v/G, atomic_load(&g_dmoe_pf_skip_bytes)/G);
++        const uint64_t n = atomic_load(&g_dmoe_pf_uploads);
++        if (n > 0) {
++            fprintf(stderr, "tosh_dmoe: compact uploads %llu, routed experts per upload %.1f (%.1f resident) | host bytes of experts with 1 / <=2 / <=4 rows %.2f / %.2f / %.2f GiB\n",
++                    (unsigned long long) n, (double) atomic_load(&g_dmoe_pf_used)/n, (double) atomic_load(&g_dmoe_pf_used_res)/n,
++                    atomic_load(&g_dmoe_pf_rare_bytes[0])/G, atomic_load(&g_dmoe_pf_rare_bytes[1])/G, atomic_load(&g_dmoe_pf_rare_bytes[2])/G);
++        }
+     }
+ }
+ 
++#define DMOE_RING_CHUNKS 8
++#define DMOE_RING_CHUNK  ((size_t) 16 << 20)
++
++struct dmoe_piece { size_t src, dst, len; };
++
++static void ggml_metal_dmoe_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
++    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++        tosh_dmoe_note_time(2, (int64_t) ((cb.GPUEndTime - cb.GPUStartTime)*1e6));
++    }];
++    [cmd_buf commit];
++    [ctx->cmd_bufs_ext addObject:cmd_buf];
++    ctx->cmd_buf_last = cmd_buf;
++    [cmd_buf retain];
++}
++
++// Copies the pieces into their ring chunk on several threads and blits them to the slot.
++static void ggml_metal_dmoe_ring_flush(ggml_metal_t ctx, const void * data, id<MTLBuffer> dst, size_t dst_offs,
++        const struct dmoe_piece * p, int n, bool * first) {
++    if (n == 0) {
++        return;
++    }
++    const int c = ctx->dmoe_ring_cur;
++    ctx->dmoe_ring_cur = (c + 1) % DMOE_RING_CHUNKS;
++    if (ctx->dmoe_ring_cmds[c]) {
++        [ctx->dmoe_ring_cmds[c] waitUntilCompleted];
++        [ctx->dmoe_ring_cmds[c] release];
++        ctx->dmoe_ring_cmds[c] = nil;
++    }
++    char * ring = (char *) ctx->dmoe_ring.contents + (size_t) c*DMOE_RING_CHUNK;
++    const size_t sub = (size_t) 1 << 20;
++    size_t n_sub = 0;
++    for (int i = 0; i < n; ++i) n_sub += (p[i].len + sub - 1)/sub;
++    dispatch_apply(n_sub, DISPATCH_APPLY_AUTO, ^(size_t k) {
++        size_t kk = k;
++        for (int i = 0; i < n; ++i) {
++            const size_t m = (p[i].len + sub - 1)/sub;
++            if (kk < m) {
++                const size_t o = kk*sub, l = MIN(sub, p[i].len - o);
++                memcpy(ring + p[i].dst + o, (const char *) data + p[i].src + o, l);
++                return;
++            }
++            kk -= m;
++        }
++    });
++    id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
++    if (*first) {
++        ggml_metal_encode_pending_waits(ctx, cmd_buf);
++        *first = false;
++    }
++    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++    for (int i = 0; i < n; ++i) {
++        [encoder copyFromBuffer:ctx->dmoe_ring sourceOffset:(size_t) c*DMOE_RING_CHUNK + p[i].dst
++                       toBuffer:dst destinationOffset:dst_offs + p[i].src size:p[i].len];
++    }
++    [encoder endEncoding];
++    ggml_metal_dmoe_submit(ctx, cmd_buf);
++    ctx->dmoe_ring_cmds[c] = [cmd_buf retain];
++}
++
++// Only the experts the chunk routes to: residents device to device, the rest from host memory
++// through the ring. Promotions copy from the filled slot once its blits are done.
++static bool ggml_metal_dmoe_compact_upload(ggml_metal_t ctx, const struct tosh_dmoe_bank_plan * plan,
++        struct ggml_metal_buffer_id bid_dst, struct ggml_metal_buffer_id bid_arena, const void * data) {
++    if (ctx->dmoe_ring == nil) {
++        ctx->dmoe_ring = [ggml_metal_device_get_obj(ctx->dev) newBufferWithLength:DMOE_RING_CHUNKS*DMOE_RING_CHUNK
++                                                                         options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
++        if (ctx->dmoe_ring == nil) {
++            return false;
++        }
++    }
++    const size_t eb = plan->expert_bytes;
++    const int32_t * rows = plan->rows;
++    bool first = true;
++    uint64_t host_bytes = 0, vram_bytes = 0, skip_bytes = 0, rare[3] = { 0, 0, 0 }, used = 0, used_res = 0;
++
++    // residents first: they need no host work and can run while the ring fills
++    {
++        id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
++        ggml_metal_encode_pending_waits(ctx, cmd_buf);
++        first = false;
++        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++        for (int e = 0; e < plan->n_expert; ++e) {
++            if (rows[e] == 0) {
++                skip_bytes += eb;
++                continue;
++            }
++            used++;
++            if (plan->slot_of[e] >= 0) {
++                [encoder copyFromBuffer:bid_arena.metal sourceOffset:bid_arena.offs + (size_t) plan->slot_of[e]*eb
++                               toBuffer:bid_dst.metal destinationOffset:bid_dst.offs + (size_t) e*eb size:eb];
++                vram_bytes += eb;
++                used_res++;
++            } else {
++                if (rows[e] <= 1) rare[0] += eb;
++                if (rows[e] <= 2) rare[1] += eb;
++                if (rows[e] <= 4) rare[2] += eb;
++            }
++        }
++        [encoder endEncoding];
++        ggml_metal_dmoe_submit(ctx, cmd_buf);
++    }
++
++    struct dmoe_piece p[64];
++    int n = 0;
++    size_t fill = 0;
++    for (int e = 0; e < plan->n_expert;) {
++        if (rows[e] == 0 || plan->slot_of[e] >= 0) {
++            ++e;
++            continue;
++        }
++        int e1 = e + 1;
++        while (e1 < plan->n_expert && rows[e1] > 0 && plan->slot_of[e1] < 0) ++e1;
++        size_t off = (size_t) e*eb, len = (size_t) (e1 - e)*eb;
++        host_bytes += len;
++        while (len > 0) {
++            if (fill == DMOE_RING_CHUNK || n == 64) {
++                ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first);
++                n = 0;
++                fill = 0;
++            }
++            const size_t take = MIN(len, DMOE_RING_CHUNK - fill);
++            p[n++] = (struct dmoe_piece) { off, fill, take };
++            fill += take;
++            off  += take;
++            len  -= take;
++        }
++        e = e1;
++    }
++    ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first);
++
++    if (plan->n_promo > 0) {
++        id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
++        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++        for (int i = 0; i < plan->n_promo; ++i) {
++            const int e = plan->promo_expert[i], sl = plan->promo_slot[i];
++            if (e < 0 || e >= plan->n_expert || sl < 0 || rows[e] == 0) continue;
++            [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs + (size_t) e*eb
++                           toBuffer:bid_arena.metal destinationOffset:bid_arena.offs + (size_t) sl*eb size:eb];
++        }
++        [encoder endEncoding];
++        ggml_metal_dmoe_submit(ctx, cmd_buf);
++    }
++
++    atomic_fetch_add(&g_dmoe_pf_host_bytes, host_bytes);
++    atomic_fetch_add(&g_dmoe_pf_vram_bytes, vram_bytes);
++    atomic_fetch_add(&g_dmoe_pf_skip_bytes, skip_bytes);
++    for (int i = 0; i < 3; ++i) atomic_fetch_add(&g_dmoe_pf_rare_bytes[i], rare[i]);
++    atomic_fetch_add(&g_dmoe_pf_uploads, 1);
++    atomic_fetch_add(&g_dmoe_pf_used, used);
++    atomic_fetch_add(&g_dmoe_pf_used_res, used_res);
++    return true;
++}
++
+ // A bank upload for prefill: experts already in the VRAM arena are copied device to device,
+ // the rest come from host memory. Same bytes land in the slot as a full upload.
+ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t size) {
+     struct tosh_dmoe_bank_plan plan;
+     if (!tosh_dmoe_enabled() || !tosh_dmoe_bank_planner(data, size, &plan)) {
+@@ -1349,10 +1525,19 @@ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * t
+     struct ggml_metal_buffer_id bid_arena = ggml_metal_get_buffer_id((const struct ggml_tensor *) plan.arena);
+     if (bid_dst.metal == nil || bid_arena.metal == nil) {
+         return false;
+     }
+ 
++    static bool registered = false;
++    if (!registered) {
++        registered = true;
++        atexit(ggml_metal_dmoe_pf_report);
++    }
++    if (plan.rows != NULL && ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
++        return true;
++    }
++
+     int stage = -1;
+     size_t offs_src = 0;
+     id<MTLBuffer> buf_src = ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_src);
+     if (buf_src == nil) {
+         stage = ctx->prefetch_stage_cur;
+@@ -1374,24 +1559,41 @@ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * t
+         }
+         offs_src = 0;
+     }
+ 
+     const size_t eb = plan.expert_bytes;
++    // with the chunk's routing only the routed experts are carried; the rest of the slot is never read
++    const int32_t * rows = plan.rows;
+     id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+     ggml_metal_encode_pending_waits(ctx, cmd_buf);
+     id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+-    uint64_t host_bytes = 0, vram_bytes = 0;
++    uint64_t host_bytes = 0, vram_bytes = 0, skip_bytes = 0, rare[3] = { 0, 0, 0 }, used = 0, used_res = 0;
+     for (int e = 0; e < plan.n_expert;) {
++        if (rows && rows[e] == 0) {
++            skip_bytes += eb;
++            ++e;
++            continue;
++        }
++        used++;
+         if (plan.slot_of[e] >= 0) {
+             [encoder copyFromBuffer:bid_arena.metal sourceOffset:bid_arena.offs + (size_t) plan.slot_of[e]*eb
+                            toBuffer:bid_dst.metal destinationOffset:bid_dst.offs + (size_t) e*eb size:eb];
+             vram_bytes += eb;
++            used_res++;
+             ++e;
+             continue;
+         }
+         int e1 = e + 1;
+-        while (e1 < plan.n_expert && plan.slot_of[e1] < 0) ++e1;
++        while (e1 < plan.n_expert && plan.slot_of[e1] < 0 && (!rows || rows[e1] > 0)) ++e1;
++        if (rows) {
++            for (int i = e; i < e1; ++i) {
++                if (rows[i] <= 1) rare[0] += eb;
++                if (rows[i] <= 2) rare[1] += eb;
++                if (rows[i] <= 4) rare[2] += eb;
++            }
++            used += e1 - e - 1;
++        }
+         const size_t off = (size_t) e*eb, len = (size_t) (e1 - e)*eb;
+         if (stage >= 0) {
+             memcpy((char *) buf_src.contents + off, (const char *) data + off, len);
+         }
+         [encoder copyFromBuffer:buf_src sourceOffset:offs_src + off
+@@ -1405,26 +1607,33 @@ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * t
+         if (e < 0 || e >= plan.n_expert || s < 0) continue;
+         [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs + (size_t) e*eb
+                        toBuffer:bid_arena.metal destinationOffset:bid_arena.offs + (size_t) s*eb size:eb];
+     }
+     [encoder endEncoding];
++    if (rows) {
++        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++            tosh_dmoe_note_time(2, (int64_t) ((cb.GPUEndTime - cb.GPUStartTime)*1e6));
++        }];
++    }
+     [cmd_buf commit];
+ 
+     [ctx->cmd_bufs_ext addObject:cmd_buf];
+     ctx->cmd_buf_last = cmd_buf;
+     if (stage >= 0) {
+         ctx->prefetch_stage_cmds[stage] = [cmd_buf retain];
+     }
+     [cmd_buf retain];
+ 
+-    static bool registered = false;
+-    if (!registered) {
+-        registered = true;
+-        atexit(ggml_metal_dmoe_pf_report);
+-    }
+     atomic_fetch_add(&g_dmoe_pf_host_bytes, host_bytes);
+     atomic_fetch_add(&g_dmoe_pf_vram_bytes, vram_bytes);
++    if (rows) {
++        atomic_fetch_add(&g_dmoe_pf_skip_bytes, skip_bytes);
++        for (int i = 0; i < 3; ++i) atomic_fetch_add(&g_dmoe_pf_rare_bytes[i], rare[i]);
++        atomic_fetch_add(&g_dmoe_pf_uploads, 1);
++        atomic_fetch_add(&g_dmoe_pf_used, used);
++        atomic_fetch_add(&g_dmoe_pf_used_res, used_res);
++    }
+     return true;
+ }
+ #endif
+ 
+ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 79e3c89d9..8447c378c 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -409,15 +409,19 @@ struct policy {
+         uint32_t uses   = 0;
+         clk::time_point issued;
+         uint8_t  parts  = 0;              // PREFILL: which of gate/up/down have been copied
+         uint64_t reserved_sync = 0;
+         uint64_t encoded_sync  = 0;
++        bool     claimed = false;         // PREFILL: taken by a bank upload rather than by admission
++        bool     drop    = false;         // PREFILL: the expert was already resident or on its way
+     };
+ 
+     // promotions carried by prefill uploads, per layer, consumed by the three bank uploads
+     std::mutex vp_mutex;
+     std::vector<std::vector<std::pair<int32_t, int32_t>>> vplan;
++    std::vector<int> claims;              // slots claimed by bank uploads, not yet seen by the policy
++    uint64_t lent = 0, lent_dropped = 0;
+     std::vector<uint8_t> vmask;
+     std::vector<int> prefill_slots;
+     uint64_t vpromotions = 0, vexpired = 0;
+ 
+     struct obs {
+@@ -434,10 +438,17 @@ struct policy {
+     float  margin = 0.0f;
+     double admit_fixed = 0.0;   // 0: estimate from the running costs
+     int    budget = 8;
+     long   stop_after = -1;
+     bool   warm_prefill = true;
++    float  tok_decay = 0.0f;              // per-token decay of prefill routing, 0 = one weight per chunk
++    int    reserve   = 0;                 // free slots per layer kept for bank uploads during prefill
++    int    reserve_tail = 0;              // how many of them go to the chunk's last tokens
++    std::vector<int> retiring_n;
++    std::vector<float> chunk_freq;        // routing of recent wide batches, halved per batch
++    uint64_t reserve_evictions = 0;
++    std::vector<float> tok_w;
+     long   verify_every = 0;
+     bool   defer_wide = true;
+     bool   vram_promote = true;
+ 
+     std::vector<const llama_tosh_dmoe_layer *> layers;
+@@ -571,15 +582,34 @@ struct policy {
+             if (rec->il < 0 || rec->il >= n_layer || layers[rec->il] == nullptr) { obs_next++; continue; }
+             // one graph of T tokens stands in for T decode steps: weight each use by the mean decay
+             const int T = rec->n_tokens;
+             const float w = (1.0f - powf(decay, (float) T))/((float) T*(1.0f - decay));
+             const int32_t * ids = obs_ring + rec->offset/sizeof(int32_t);
++            if ((int) chunk_freq.size() != n_layer*n_expert) chunk_freq.assign((size_t) n_layer*n_expert, 0.0f);
++            for (int e = 0; e < n_expert; ++e) chunk_freq[(size_t) rec->il*n_expert + e] *= 0.5f;
++            for (int i = 0; i < rec->n_used*T; ++i) {
++                if (ids[i] >= 0 && ids[i] < n_expert) chunk_freq[(size_t) rec->il*n_expert + ids[i]] += 1.0f;
++            }
++            if (warm_prefill && tok_decay > 0.0f) {
++                // decode follows the end of the prompt: age the layer by T tokens, then weight each
++                // token by its distance to the chunk's end
++                const float age = powf(tok_decay, (float) T);
++                for (int e = 0; e < n_expert; ++e) {
++                    const size_t key = (size_t) rec->il*n_expert + e;
++                    score[key] = decayed(key, rec->tick)*age;
++                    last_tick[key] = rec->tick;
++                }
++                tok_w.resize(T);
++                for (int t = 0; t < T; ++t) tok_w[t] = powf(tok_decay, (float) (T - 1 - t));
++            }
+             for (int i = 0; i < rec->n_used*T; ++i) {
+                 const int e = ids[i];
+                 if (e < 0 || e >= n_expert) continue;
+                 const size_t key = (size_t) rec->il*n_expert + e;
+-                if (warm_prefill) {
++                if (warm_prefill && tok_decay > 0.0f) {
++                    score[key] += tok_w[i/rec->n_used];
++                } else if (warm_prefill) {
+                     score[key] = decayed(key, rec->tick) + w;
+                     last_tick[key] = rec->tick;
+                 }
+                 if (resident_slot[key] < 0 && !pending[key]) cands.push_back({ 0.0f, key });
+             }
+@@ -609,40 +639,61 @@ struct policy {
+                 }
+                 dirty = true;
+             } else {
+                 failed++;
+                 sl.state = FREE; sl.e = -1;
++                std::lock_guard<std::mutex> lock(vp_mutex);
+                 free_list[il].push_back(s);
+             }
+             pending_slots[i] = pending_slots.back();
+             pending_slots.pop_back();
+         }
+ 
+         // 2b. promotions carried by prefill uploads: resident once the graph that copied them is done
+         {
+             std::lock_guard<std::mutex> lock(vp_mutex);
++            for (const int gs : claims) {
++                slot & sl = slots[gs];
++                const size_t key = (size_t) (gs / Q)*n_expert + sl.e;
++                if (resident_slot[key] >= 0 || pending[key]) {
++                    sl.drop = true;
++                    lent_dropped++;
++                } else {
++                    pending[key] = 1;
++                }
++            }
++            claims.clear();
+             for (size_t i = 0; i < prefill_slots.size();) {
+                 const int gs = prefill_slots[i];
+                 slot & sl = slots[gs];
+                 const int il = gs / Q, s = gs % Q;
+                 const size_t key = (size_t) il*n_expert + sl.e;
+-                if (sl.parts == 7 && sync > sl.encoded_sync) {
+-                    sl.state = RESIDENT; sl.since = now; sl.uses = 0;
++                if (sl.drop && ((sl.parts == 7 && sync > sl.encoded_sync) || sync > sl.reserved_sync + 16) && vmask[il] == 0) {
++                    // a duplicate: free the slot once nothing can still be copying into it
++                    auto & lst = vplan[il];
++                    lst.erase(std::remove_if(lst.begin(), lst.end(), [s](auto & q) { return q.second == s; }), lst.end());
++                    sl.state = FREE; sl.e = -1; sl.parts = 0; sl.drop = false; sl.claimed = false;
++                    free_list[il].push_back(s);
++                } else if (sl.drop) {
++                    ++i;
++                    continue;
++                } else if (sl.parts == 7 && sync > sl.encoded_sync) {
++                    sl.state = RESIDENT; sl.since = now; sl.uses = 0; sl.claimed = false;
+                     resident_slot[key] = s;
+                     pending[key] = 0;
+                     dirty = true;
+                     if (verify_every > 0 && vpromotions % verify_every == 0) {
+                         verified++;
+                         if (!verify_slot(il, s)) verify_bad++;
+                     }
+-                } else if (sl.parts != 7 && sync > sl.reserved_sync + 16) {
++                } else if (sl.parts != 7 && sync > sl.reserved_sync + 16 && vmask[il] == 0) {
+                     // never fully carried: drop it, its layer's plan with it
+                     auto & lst = vplan[il];
+                     lst.erase(std::remove_if(lst.begin(), lst.end(), [s](auto & p) { return p.second == s; }), lst.end());
+                     if (lst.empty()) vmask[il] = 0;
+                     pending[key] = 0;
+-                    sl.state = FREE; sl.e = -1; sl.parts = 0;
++                    sl.state = FREE; sl.e = -1; sl.parts = 0; sl.claimed = false;
+                     free_list[il].push_back(s);
+                     vexpired++;
+                 } else {
+                     ++i;
+                     continue;
+@@ -655,10 +706,11 @@ struct policy {
+         // 3. retired slots nobody can still read
+         for (size_t i = 0; i < retiring_slots.size();) {
+             slot & sl = slots[retiring_slots[i]];
+             if (sl.retire_sync != UINT64_MAX && sync >= sl.retire_sync + 2) {
+                 sl.state = FREE; sl.e = -1;
++                std::lock_guard<std::mutex> lock(vp_mutex);
+                 free_list[retiring_slots[i] / Q].push_back(retiring_slots[i] % Q);
+                 retiring_slots[i] = retiring_slots.back();
+                 retiring_slots.pop_back();
+             } else {
+                 ++i;
+@@ -682,11 +734,16 @@ struct policy {
+             int retired = 0;
+             for (auto & [sc, key] : cands) {
+                 if (sc < admit_used || issued_tick >= budget) break;
+                 const int il = (int) (key / n_expert), e = (int) (key % n_expert);
+                 if (resident_slot[key] >= 0 || pending[key]) continue;
+-                if (free_list[il].empty()) {
++                bool no_free;
++                {
++                    std::lock_guard<std::mutex> lock(vp_mutex);
++                    no_free = free_list[il].empty();
++                }
++                if (no_free) {
+                     if (retired >= budget) continue;
+                     int victim = -1; float vs = 0;
+                     for (int s = 0; s < Q; ++s) {
+                         const slot & sl = slots[(size_t) il*Q + s];
+                         if (sl.state != RESIDENT) continue;
+@@ -707,23 +764,28 @@ struct policy {
+                     continue;   // the candidate takes a slot once one frees
+                 }
+                 // during a wide batch the upload of the layer's bank carries the expert over
+                 if (wide && vram_promote) {
+                     std::lock_guard<std::mutex> lock(vp_mutex);
+-                    if (vmask[il] != 0) continue;   // this layer's plan is half consumed
++                    if (vmask[il] != 0 || free_list[il].empty()) continue;   // half consumed, or lent meanwhile
+                     const int s = free_list[il].back();
+                     free_list[il].pop_back();
+                     slot & sl = slots[(size_t) il*Q + s];
+                     sl.state = PREFILL; sl.e = e; sl.gen++; sl.parts = 0; sl.reserved_sync = sync;
+                     vplan[il].push_back({ e, s });
+                     prefill_slots.push_back(il*Q + s);
+                     pending[key] = 1;
+                     vpromotions++; issued_tick++;
+                     continue;
+                 }
+-                const int s = free_list[il].back();
+-                free_list[il].pop_back();
++                int s;
++                {
++                    std::lock_guard<std::mutex> lock(vp_mutex);
++                    if (free_list[il].empty()) continue;
++                    s = free_list[il].back();
++                    free_list[il].pop_back();
++                }
+                 slot & sl = slots[(size_t) il*Q + s];
+                 const llama_tosh_dmoe_layer * dl = layers[il];
+                 const host_bank & b = (*banks)[il];
+                 tosh_dmoe_copy copies[3] = {
+                     { dl->arena_gate, (size_t) s*dl->arena_gate->nb[2], (const char *) b.gate->data + (size_t) e*b.gate->nb[2], dl->arena_gate->nb[2] },
+@@ -735,10 +797,11 @@ struct policy {
+                 sl.ticket = up->upload(up->ctx, copies, 3);
+                 us_upload_call += std::chrono::duration<double, std::micro>(clk::now() - tu).count();
+                 if (sl.ticket == 0) {
+                     failed++;
+                     sl.state = FREE; sl.e = -1;
++                    std::lock_guard<std::mutex> lock(vp_mutex);
+                     free_list[il].push_back(s);
+                     continue;
+                 }
+                 sl.state = PENDING;
+                 pending[key] = 1;
+@@ -747,10 +810,44 @@ struct policy {
+                 if (now < promo_by_tick.size()) promo_by_tick[now]++;
+                 bytes_promoted += copies[0].size + copies[1].size + copies[2].size;
+                 if (evicted_tick[key] != 0 && now - evicted_tick[key] < 64) repromotions++;
+             }
+         }
++        // 4b. during prefill keep a few free slots per layer for the bank uploads to lend
++        if (reserve > 0 && wide) {
++            retiring_n.assign(n_layer, 0);
++            for (const int gs : retiring_slots) retiring_n[gs / Q]++;
++            for (int il = 0; il < n_layer; ++il) {
++                if (layers[il] == nullptr) continue;
++                int n_free;
++                {
++                    std::lock_guard<std::mutex> lock(vp_mutex);
++                    n_free = (int) free_list[il].size();
++                }
++                for (int need = reserve - n_free - retiring_n[il]; need > 0; --need) {
++                    // the least routed resident of recent batches: later chunks will not miss it
++                    int victim = -1; float vs = 0;
++                    for (int s = 0; s < Q; ++s) {
++                        const slot & sl = slots[(size_t) il*Q + s];
++                        if (sl.state != RESIDENT) continue;
++                        const size_t k = (size_t) il*n_expert + sl.e;
++                        const float v = (chunk_freq.empty() ? 0.0f : chunk_freq[k]) + 1e-3f*decayed(k, now);
++                        if (victim < 0 || v < vs) { victim = s; vs = v; }
++                    }
++                    if (victim < 0) break;
++                    slot & sl = slots[(size_t) il*Q + victim];
++                    const size_t vkey = (size_t) il*n_expert + sl.e;
++                    resident_slot[vkey] = -1;
++                    evicted_tick[vkey] = now;
++                    lifetime_sum += now - sl.since; lifetime_n++; uses_sum += sl.uses;
++                    sl.state = RETIRING; sl.retire_sync = UINT64_MAX;
++                    retiring_slots.push_back(il*Q + victim);
++                    evictions++; reserve_evictions++;
++                    dirty = true;
++                }
++            }
++        }
+         const clk::time_point t2 = clk::now();
+ 
+         // 5. publish a table with what is resident now, into a version no graph can be reading
+         if (dirty) {
+             int next = -1;
+@@ -826,13 +923,14 @@ struct policy {
+             if (FILE * f = fopen(p, "w")) {
+                 for (size_t t = 1; t < promo_by_tick.size() && t <= graphs; ++t) fprintf(f, "%zu %u\n", t, promo_by_tick[t]);
+                 fclose(f);
+             }
+         }
+-        if (vpromotions > 0) {
+-            fprintf(stderr, "tosh_dmoe: promotions carried by prefill uploads %llu, expired %llu\n",
+-                    (unsigned long long) vpromotions, (unsigned long long) vexpired);
++        if (vpromotions + lent > 0) {
++            fprintf(stderr, "tosh_dmoe: promotions carried by prefill uploads %llu, expired %llu | free slots lent to prefill uploads %llu, duplicates dropped %llu\n",
++                    (unsigned long long) vpromotions, (unsigned long long) vexpired, (unsigned long long) lent, (unsigned long long) lent_dropped);
++            fprintf(stderr, "tosh_dmoe: evictions to keep %d free slots per layer during prefill %llu\n", reserve, (unsigned long long) reserve_evictions);
+         }
+         if (obs_prefill + obs_lost > 0) {
+             fprintf(stderr, "tosh_dmoe: prefill routing observed %llu selections, %llu records lost\n",
+                     (unsigned long long) obs_prefill, (unsigned long long) obs_lost);
+         }
+@@ -870,30 +968,80 @@ static bool dmoe_bank_plan(const void * host, size_t size, tosh_dmoe_bank_plan *
+     plan->n_expert     = g_n_expert;
+     plan->expert_bytes = r.bank->nb[2];
+     plan->promo_expert = nullptr;
+     plan->promo_slot   = nullptr;
+     plan->n_promo      = 0;
++    int n_rows = 0;
++    plan->rows = tosh_dmoe_chunk_rows(&n_rows);
++    if (n_rows != g_n_expert) {
++        plan->rows = nullptr;
++    }
++    const int32_t * rows = plan->rows;
+     if (g_policy != nullptr) {
+         plan->slot_of = g_policy->tables + ((size_t) tosh_dmoe_published_version()*TOSH_DMOE_MAX_LAYERS + r.il)*g_n_expert;
+         static std::vector<int32_t> pe, ps;
++        static std::vector<std::pair<int32_t, int32_t>> want;
++        static const bool lend = getenv("TOSH_DMOE_LEND") == nullptr || atoi(getenv("TOSH_DMOE_LEND")) != 0;
+         policy & p = *g_policy;
+         std::lock_guard<std::mutex> lock(p.vp_mutex);
+         auto & lst = p.vplan[r.il];
++        auto & fl  = p.free_list[r.il];
++        if (lend && rows && p.vmask[r.il] == 0 && !fl.empty()) {
++            // free slots take the chunk's busiest host experts: the upload brings them into VRAM anyway
++            // the chunk's last tokens first, since decode continues from them; then its busiest experts
++            const float * tail = tosh_dmoe_chunk_tail();
++            want.clear();
++            for (int e = 0; e < g_n_expert; ++e) {
++                if (rows[e] > 0 && plan->slot_of[e] < 0) want.push_back({ rows[e], e });
++            }
++            for (auto [e, s] : lst) {
++                for (auto & w : want) if (w.second == e) w.first = 0;
++            }
++            std::sort(want.begin(), want.end(), [](auto & a, auto & b) { return a.first > b.first; });
++            if (tail != nullptr && p.reserve_tail > 0) {
++                std::stable_sort(want.begin(), want.end(), [tail](auto & a, auto & b) {
++                    return (a.first > 0 ? tail[a.second] : -1.0f) > (b.first > 0 ? tail[b.second] : -1.0f);
++                });
++                const size_t k = std::min<size_t>(p.reserve_tail, want.size());
++                std::sort(want.begin() + k, want.end(), [](auto & a, auto & b) { return a.first > b.first; });
++            }
++            const uint64_t sync = tosh_dmoe_completed_value();
++            for (auto [n, e] : want) {
++                if (fl.empty()) break;
++                if (n == 0) continue;
++                const int s = fl.back();
++                fl.pop_back();
++                const int gs = r.il*p.Q + s;
++                auto & sl = p.slots[gs];
++                sl.state = policy::PREFILL; sl.e = e; sl.gen++; sl.parts = 0; sl.reserved_sync = sync;
++                sl.claimed = true; sl.drop = false;
++                lst.push_back({ e, s });
++                p.prefill_slots.push_back(gs);
++                p.claims.push_back(gs);
++                p.lent++;
++            }
++        }
+         if (!lst.empty() && !(p.vmask[r.il] & (1u << r.which))) {
+             pe.clear(); ps.clear();
+             for (auto [e, s] : lst) {
++                // only a routed expert lands in the upload; the others wait for a chunk that routes them
++                if (rows && rows[e] == 0) continue;
+                 pe.push_back(e); ps.push_back(s);
+                 auto & sl = p.slots[(size_t) r.il*p.Q + s];
+                 sl.parts |= (uint8_t) (1u << r.which);
+                 if (sl.parts == 7) sl.encoded_sync = tosh_dmoe_completed_value();
+             }
+             plan->promo_expert = pe.data();
+             plan->promo_slot   = ps.data();
+             plan->n_promo      = (int) pe.size();
+             p.vmask[r.il] |= (uint8_t) (1u << r.which);
+             if (p.vmask[r.il] == 7) {
+-                lst.clear();
++                if (rows) {
++                    lst.erase(std::remove_if(lst.begin(), lst.end(), [rows](auto & q) { return rows[q.first] > 0; }), lst.end());
++                } else {
++                    lst.clear();
++                }
+                 p.vmask[r.il] = 0;
+             }
+         }
+     } else {
+         plan->slot_of = g_fixed_slots[r.il].data();
+@@ -1102,10 +1250,13 @@ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams
+         // 0: no per-graph cap; the stage ring still bounds the uploads in flight
+         pol->budget       = (int) envf("TOSH_DMOE_BUDGET", 0);
+         if (pol->budget <= 0) pol->budget = n_layer*n_expert;
+         pol->stop_after   = (long) envf("TOSH_DMOE_PROMO_STOP", -1);
+         pol->warm_prefill = envf("TOSH_DMOE_WARM_PREFILL", 1) != 0;
++        pol->tok_decay    = tosh_dmoe_token_decay();
++        pol->reserve      = (int) envf("TOSH_DMOE_LEND_RESERVE", 8);
++        pol->reserve_tail = (int) envf("TOSH_DMOE_LEND_TAIL", 8);
+         pol->verify_every = (long) envf("TOSH_DMOE_VERIFY", 0);
+         pol->defer_wide   = envf("TOSH_DMOE_DEFER_WIDE", 0) != 0;
+         pol->vram_promote = envf("TOSH_DMOE_PREFILL_PROMOTE", 1) != 0;
+         pol->vplan.resize(n_layer);
+         pol->vmask.assign(n_layer, 0);
+diff --git a/tosh-moe/tosh-dmoe.cpp b/tosh-moe/tosh-dmoe.cpp
+index e3c31c44f..a3a0a5d94 100644
+--- a/tosh-moe/tosh-dmoe.cpp
++++ b/tosh-moe/tosh-dmoe.cpp
+@@ -1,8 +1,9 @@
+ #include "tosh-dmoe.h"
+ 
+ #include <atomic>
++#include <cstdio>
+ #include <cstdlib>
+ #include <chrono>
+ #include <condition_variable>
+ #include <mutex>
+ 
+@@ -105,10 +106,45 @@ uint64_t tosh_dmoe_tick_next(void) { return g_tick.fetch_add(1) + 1; }
+ static std::atomic<bool> g_wide{false};
+ void tosh_dmoe_note_wide(bool wide) { g_wide.store(wide); }
+ bool tosh_dmoe_wide(void)           { return g_wide.load(); }
+ uint64_t tosh_dmoe_tick(void)      { return g_tick.load(); }
+ 
++bool tosh_dmoe_compact(void) {
++    static const bool on = getenv("TOSH_DMOE_COMPACT") == nullptr || atoi(getenv("TOSH_DMOE_COMPACT")) != 0;
++    return on && tosh_dmoe_enabled();
++}
++static const int32_t * g_chunk_rows = nullptr;
++static const float *   g_chunk_tail = nullptr;
++static int g_chunk_experts = 0;
++void tosh_dmoe_set_chunk_rows(const int32_t * rows, const float * tail, int n_expert) {
++    g_chunk_rows = rows; g_chunk_tail = tail; g_chunk_experts = n_expert;
++}
++const float * tosh_dmoe_chunk_tail(void) { return g_chunk_tail; }
++float tosh_dmoe_token_decay(void) {
++    static const float d = getenv("TOSH_DMOE_PREFILL_TOKEN_DECAY") ? (float) atof(getenv("TOSH_DMOE_PREFILL_TOKEN_DECAY")) : 0.95f;
++    return d;
++}
++static std::atomic<int64_t> g_pf_us[4];
++static std::atomic<int64_t> g_pf_n[4];
++static void pf_time_report() {
++    if (getenv("TOSH_DMOE_STATS") && g_pf_n[1].load() > 0) {
++        fprintf(stderr, "tosh_dmoe: prefill time waiting for ids %.1f ms (%lld), counting rows %.1f ms, issuing uploads %.1f ms (%lld), upload gpu %.1f ms (%lld)\n",
++                g_pf_us[0].load()/1e3, (long long) g_pf_n[0].load(), g_pf_us[3].load()/1e3, g_pf_us[1].load()/1e3, (long long) g_pf_n[1].load(),
++                g_pf_us[2].load()/1e3, (long long) g_pf_n[2].load());
++    }
++}
++void tosh_dmoe_note_time(int what, int64_t us) {
++    static std::once_flag once;
++    std::call_once(once, [] { atexit(pf_time_report); });
++    g_pf_us[what] += us;
++    g_pf_n[what]++;
++}
++const int32_t * tosh_dmoe_chunk_rows(int * n_expert) {
++    if (n_expert) *n_expert = g_chunk_experts;
++    return g_chunk_rows;
++}
++
+ void tosh_dmoe_mark_completed(void) {
+     {
+         std::lock_guard<std::mutex> lock(g_done_mutex);
+         g_completed.fetch_add(1);
+     }
+diff --git a/tosh-moe/tosh-dmoe.h b/tosh-moe/tosh-dmoe.h
+index 4fa08494c..13747f34f 100644
+--- a/tosh-moe/tosh-dmoe.h
++++ b/tosh-moe/tosh-dmoe.h
+@@ -108,10 +108,12 @@ struct tosh_dmoe_bank_plan {
+     size_t          expert_bytes;
+     // experts to copy from the freshly filled upload into free arena slots, for decode
+     const int32_t * promo_expert;
+     const int32_t * promo_slot;
+     int             n_promo;
++    // rows per expert of the chunk being uploaded, or null to carry the whole bank
++    const int32_t * rows;
+ };
+ typedef bool (*tosh_dmoe_bank_plan_fn)(const void * host, size_t size, struct tosh_dmoe_bank_plan * plan);
+ void tosh_dmoe_set_bank_planner(tosh_dmoe_bank_plan_fn fn);
+ bool tosh_dmoe_bank_planner(const void * host, size_t size, struct tosh_dmoe_bank_plan * plan);
+ 
+@@ -140,8 +142,20 @@ bool                          tosh_dmoe_obs_intact(const struct tosh_dmoe_obs_re
+ // waits forever, and the caller aborts the batch.
+ void         tosh_dmoe_fail(const char * why);
+ const char * tosh_dmoe_failed(void);
+ void         tosh_dmoe_clear_failure(void);
+ 
++// Compact prefill: a wide batch uploads only the experts its chunk routes to. The scheduler reads
++// the chunk's ids and sets the rows per expert right before the bank upload that consumes them.
++bool            tosh_dmoe_compact(void);
++void            tosh_dmoe_set_chunk_rows(const int32_t * rows, const float * tail, int n_expert);
++const int32_t * tosh_dmoe_chunk_rows(int * n_expert);
++// per expert, its routing weighted by closeness to the chunk's end (TOSH_DMOE_PREFILL_TOKEN_DECAY)
++const float *   tosh_dmoe_chunk_tail(void);
++float           tosh_dmoe_token_decay(void);
++// prefill time accounting: 0 waiting for the chunk's ids, 1 issuing bank uploads, 2 upload GPU time,
++// 3 counting rows per expert
++void            tosh_dmoe_note_time(int what, int64_t us);
++
+ #ifdef __cplusplus
+ }
+ #endif

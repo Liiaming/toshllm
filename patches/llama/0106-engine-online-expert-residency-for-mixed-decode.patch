@@ -1,0 +1,1164 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 5ddf9051a..ecd03983a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -1218,11 +1218,14 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     if (ctx->cmd_buf_last) {
+         [ctx->cmd_buf_last waitUntilCompleted];
+         ctx->cmd_buf_last = nil;
+     }
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+-    tosh_dmoe_set_active(false);
++    if (tosh_dmoe_enabled()) {
++        tosh_dmoe_set_active(false);
++        tosh_dmoe_mark_completed();
++    }
+     if (tosh_dmoe_failed() != NULL && !ctx->has_error) {
+         GGML_LOG_ERROR("%s: mixed expert execution failed: %s\n", __func__, tosh_dmoe_failed());
+         ctx->has_error = true;
+     }
+ #endif
+@@ -4246,20 +4249,32 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
+         return GGML_STATUS_FAILED;
+     }
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+-    // mixed layers get their event values in submission order, before any parallel encoding
+-    for (int i = 0; i < gf->n_nodes; ++i) {
++    // mixed layers get their event values in submission order, before any parallel encoding;
++    // a dynamic cache also pins the residency table this graph reads
++    const bool dmoe_on = tosh_dmoe_enabled();
++    const int dmoe_version = dmoe_on ? tosh_dmoe_published_version() : 0;
++    bool dmoe_ticked = false;
++    for (int i = 0; dmoe_on && i < gf->n_nodes; ++i) {
+         struct ggml_tensor * node = gf->nodes[i];
+         if (node->op != GGML_OP_TOSH_DMOE_PUBLISH) {
+             continue;
+         }
+         const uint64_t value = tosh_dmoe_next_value();
+         memcpy(&node->op_params[2], &value, sizeof(value));
+ 
++        ggml_set_op_params_i32(node, 4, dmoe_version);
++        if (!dmoe_ticked) {
++            tosh_dmoe_tick_next();
++            dmoe_ticked = true;
++        }
++
+         struct tosh_dmoe_job * job = tosh_dmoe_job_of(value);
++        job->version  = dmoe_version;
++        job->tick     = (uint32_t) tosh_dmoe_tick();
+         job->il       = ggml_get_op_params_i32(node, 0);
+         job->n_tokens = (int32_t) node->src[1]->ne[1];
+         job->n_used   = (int32_t) node->src[1]->ne[0];
+         job->n_embd   = (int32_t) node->src[0]->ne[0];
+         __atomic_store_n(&job->value, value, __ATOMIC_RELEASE);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index fa4265939..ad04dbff0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -383,10 +383,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ void *                      ggml_metal_device_dmoe_event(ggml_metal_device_t dev);
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_stage(ggml_metal_device_t dev, size_t layer_stride);
++struct ggml_metal_buffer_id ggml_metal_device_dmoe_tables(ggml_metal_device_t dev);
+ #endif
+ 
+ struct ggml_metal_fusion_info;
+ 
+ // the device-owned fusion debugging context (NULL unless fusion debugging is enabled)
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 06440713b..9d78876d5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1120,10 +1120,11 @@ struct ggml_metal_device {
+ 
+     // mixed expert execution: one event and one host-visible stage, created on first use
+     id<MTLSharedEvent> dmoe_ev;
+     id<MTLBuffer>      dmoe_stage;
+     NSLock *           dmoe_lock;
++    id<MTLBuffer>      dmoe_tables;
+ };
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ static uint64_t ggml_metal_dmoe_ev_get(void * ev) { return [(id<MTLSharedEvent>) ev signaledValue]; }
+ static void ggml_metal_dmoe_ev_set(void * ev, uint64_t v) { [(id<MTLSharedEvent>) ev setSignaledValue:v]; }
+@@ -1136,10 +1137,135 @@ void * ggml_metal_device_dmoe_event(ggml_metal_device_t dev) {
+     }
+     [dev->dmoe_lock unlock];
+     return dev->dmoe_ev;
+ }
+ 
++struct ggml_metal_buffer_id ggml_metal_device_dmoe_tables(ggml_metal_device_t dev) {
++    struct ggml_metal_buffer_id res = { nil, 0 };
++    size_t bytes = 0;
++    int32_t * host = tosh_dmoe_tables(&bytes, NULL, NULL);
++    if (host == NULL) {
++        return res;
++    }
++    [dev->dmoe_lock lock];
++    if (dev->dmoe_tables == nil) {
++        dev->dmoe_tables = [dev->mtl_device newBufferWithBytesNoCopy:host length:bytes options:MTLResourceStorageModeShared deallocator:nil];
++        GGML_ASSERT(dev->dmoe_tables != nil && "residency tables must be page aligned");
++    }
++    [dev->dmoe_lock unlock];
++    res.metal = dev->dmoe_tables;
++    return res;
++}
++
++// promotions: a queue of their own and a bounded host-visible stage the canonical bytes pass through
++#define DMOE_UP_SLOTS   8
++#define DMOE_UP_BYTES   (8u << 20)
++#define DMOE_UP_TICKETS 1024
++
++struct ggml_metal_dmoe_up {
++    ggml_metal_device_t  dev;
++    id<MTLCommandQueue>  queue;
++    id<MTLBuffer>        stage[DMOE_UP_SLOTS];
++    id<MTLCommandBuffer> stage_cb[DMOE_UP_SLOTS];
++    id<MTLCommandBuffer> tickets[DMOE_UP_TICKETS];
++    uint64_t             n_tickets;
++    int                  next;
++    long                 fail_at;   // test only
++    NSLock *             lock;
++};
++
++static uint64_t ggml_metal_dmoe_upload_impl(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n);
++
++static uint64_t ggml_metal_dmoe_upload(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n) {
++    @autoreleasepool {
++        return ggml_metal_dmoe_upload_impl(ctx_raw, copies, n);
++    }
++}
++
++static uint64_t ggml_metal_dmoe_upload_impl(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n) {
++    struct ggml_metal_dmoe_up * up = ctx_raw;
++    [up->lock lock];
++    const uint64_t ticket = ++up->n_tickets;
++    if ((long) ticket == up->fail_at) {
++        [up->lock unlock];
++        return 0;
++    }
++    const int s = up->next;
++    up->next = (up->next + 1) % DMOE_UP_SLOTS;
++    if (up->stage_cb[s] != nil) {
++        [up->stage_cb[s] waitUntilCompleted];
++        [up->stage_cb[s] release];
++        up->stage_cb[s] = nil;
++    }
++    size_t total = 0;
++    for (int i = 0; i < n; ++i) {
++        total += copies[i].size;
++    }
++    if (total > DMOE_UP_BYTES) {
++        [up->lock unlock];
++        return 0;
++    }
++    char * stage = [up->stage[s] contents];
++    size_t off = 0;
++    id<MTLCommandBuffer> cb = [up->queue commandBuffer];
++    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++    for (int i = 0; i < n; ++i) {
++        const struct ggml_tensor * t = copies[i].dst;
++        ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
++        struct ggml_metal_buffer_id dst = ggml_metal_buffer_get_id(buffer->context, t);
++        memcpy(stage + off, copies[i].src, copies[i].size);
++        [blit copyFromBuffer:up->stage[s] sourceOffset:off toBuffer:dst.metal destinationOffset:dst.offs + copies[i].offset size:copies[i].size];
++        off += copies[i].size;
++    }
++    [blit endEncoding];
++    [cb commit];
++    [cb retain];
++    [cb retain];
++    up->stage_cb[s] = cb;
++    id<MTLCommandBuffer> old = up->tickets[ticket % DMOE_UP_TICKETS];
++    up->tickets[ticket % DMOE_UP_TICKETS] = cb;
++    [up->lock unlock];
++    if (old != nil) {
++        [old release];
++    }
++    return ticket;
++}
++
++static int ggml_metal_dmoe_upload_status(void * ctx_raw, uint64_t ticket) {
++    struct ggml_metal_dmoe_up * up = ctx_raw;
++    [up->lock lock];
++    id<MTLCommandBuffer> cb = up->tickets[ticket % DMOE_UP_TICKETS];
++    const MTLCommandBufferStatus st = cb != nil ? [cb status] : MTLCommandBufferStatusError;
++    [up->lock unlock];
++    if (st == MTLCommandBufferStatusCompleted) return 1;
++    if (st == MTLCommandBufferStatusError)     return -1;
++    return 0;
++}
++
++static double ggml_metal_dmoe_upload_gpu_us(void * ctx_raw, uint64_t ticket) {
++    struct ggml_metal_dmoe_up * up = ctx_raw;
++    [up->lock lock];
++    id<MTLCommandBuffer> cb = up->tickets[ticket % DMOE_UP_TICKETS];
++    const double us = cb != nil ? ([cb GPUEndTime] - [cb GPUStartTime])*1e6 : 0.0;
++    [up->lock unlock];
++    return us;
++}
++
++static void ggml_metal_dmoe_uploader_init(ggml_metal_device_t dev) {
++    struct ggml_metal_dmoe_up * up = calloc(1, sizeof(struct ggml_metal_dmoe_up));
++    up->dev   = dev;
++    up->queue = [dev->mtl_device newCommandQueue];
++    for (int i = 0; i < DMOE_UP_SLOTS; ++i) {
++        up->stage[i] = [dev->mtl_device newBufferWithLength:DMOE_UP_BYTES options:MTLResourceStorageModeShared];
++    }
++    up->lock = [[NSLock alloc] init];
++    const char * f = getenv("TOSH_DMOE_TEST_UPLOAD_FAIL");
++    up->fail_at = f ? atol(f) : -1;
++    struct tosh_dmoe_uploader u = { up, ggml_metal_dmoe_upload, ggml_metal_dmoe_upload_status, ggml_metal_dmoe_upload_gpu_us };
++    tosh_dmoe_set_uploader(&u);
++}
++
+ struct ggml_metal_buffer_id ggml_metal_device_dmoe_stage(ggml_metal_device_t dev, size_t layer_stride) {
+     [dev->dmoe_lock lock];
+     const size_t size = layer_stride*TOSH_DMOE_MAX_LAYERS;
+     if (dev->dmoe_stage == nil || [dev->dmoe_stage length] < size) {
+         GGML_ASSERT(dev->dmoe_stage == nil && "the stage stride cannot change once allocated");
+@@ -1444,10 +1570,15 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+                 }
+ 
+                 dev->stage_lock = [[NSRecursiveLock alloc] init];
+                 dev->wrap_lock  = [[NSLock alloc] init];
+                 dev->dmoe_lock  = [[NSLock alloc] init];
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++                if (getenv("TOSH_DMOE_CACHE_MIB") != NULL && tosh_dmoe_get_uploader() == NULL) {
++                    ggml_metal_dmoe_uploader_init(dev);
++                }
++#endif
+ 
+                 dev->addr_virt = 0x000000400ULL;
+ 
+                 dev->props.device = device;
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 76d886147..4acdb9181 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4323,11 +4323,18 @@ int ggml_metal_op_tosh_dmoe_publish(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_t enc = ctx->enc;
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur), 1);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 2);
+-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res), 3);
++    // a dynamic cache reads the table version this graph was submitted with
++    ggml_metal_buffer_id bid_res = ggml_metal_device_dmoe_tables(ctx->dev);
++    if (bid_res.metal != nullptr) {
++        bid_res.offs = ((size_t) ggml_get_op_params_i32(op, 4)*TOSH_DMOE_MAX_LAYERS + il)*res->ne[0]*sizeof(int32_t);
++    } else {
++        bid_res = ggml_metal_get_buffer_id(res);
++    }
++    ggml_metal_encoder_set_buffer  (enc, bid_res, 3);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  4);
+     ggml_metal_encoder_set_buffer  (enc, bid_stage, 5);
+     ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, 1, 1, 256, 1, 1);
+ 
+     ggml_metal_encoder_event(enc, ctx->cmd_buf, ev, value, true);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6b2b372f0..f6cdd42e2 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3142,10 +3142,11 @@ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
+ void llama_free_model(llama_model * model) {
+     llama_model_free(model);
+ }
+ 
+ void llama_model_free(llama_model * model) {
++    llama_tosh_dmoe_shutdown();
+     delete model;
+ }
+ 
+ int32_t llama_model_n_ctx_train(const llama_model * model) {
+     return model->hparams.n_ctx_train;
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 6f8849dad..3457f0744 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -9,10 +9,11 @@
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
+ #endif
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -42,10 +43,11 @@ const llama_tosh_dmoe_layer * llama_tosh_dmoe_layer_of(const ggml_tensor * gate_
+ }
+ 
+ #ifndef TOSH_ENABLE_DYNAMIC_MOE
+ 
+ void llama_tosh_dmoe_init(std::vector<llama_layer> &, const llama_hparams &) {}
++void llama_tosh_dmoe_shutdown() {}
+ 
+ #else
+ 
+ namespace {
+ 
+@@ -98,10 +100,18 @@ struct executor {
+ 
+     std::vector<std::thread> helpers;
+     std::thread leader;
+     std::thread watchdog;
+ 
++    // dynamic residency: what the last job routed, handed to the policy once the GPU is released
++    void (*observe)(void * ctx, int il, const int32_t * ids, const int32_t * slots, int n, bool multi, uint32_t tick) = nullptr;
++    void * observe_ctx = nullptr;
++    int32_t obs_ids[TOSH_DMOE_MAX_TOKENS*256];
++    int32_t obs_slots[TOSH_DMOE_MAX_TOKENS*256];
++    int     obs_n = 0;
++    std::vector<std::atomic<uint32_t>> hits_by_tick, routed_by_tick;
++
+     // stats
+     std::atomic<uint64_t> n_jobs{0}, n_routed{0}, n_miss{0};
+     std::atomic<uint64_t> us_job{0}, us_quant{0}, us_p1{0}, us_p2{0};
+     std::vector<std::atomic<uint64_t>> miss_by_layer;
+     std::vector<std::atomic<uint64_t>> routed_by_layer;
+@@ -238,10 +248,19 @@ struct executor {
+         const uint64_t routed = (uint64_t) jb.n_tokens*n_used;
+         n_routed += routed;
+         n_miss   += misses.size();
+         routed_by_layer[il] += routed;
+         miss_by_layer[il]   += misses.size();
++        if (jb.tick < hits_by_tick.size()) {
++            routed_by_tick[jb.tick] += routed;
++            hits_by_tick[jb.tick]   += routed - misses.size();
++        }
++        if (observe != nullptr && routed <= sizeof(obs_ids)/sizeof(obs_ids[0])) {
++            memcpy(obs_ids,   ids,   routed*sizeof(int32_t));
++            memcpy(obs_slots, slots, routed*sizeof(int32_t));
++            obs_n = (int) routed;
++        }
+ 
+         if (!misses.empty()) {
+             const clk::time_point tq = clk::now();
+             const auto from_float = ggml_get_type_traits_cpu(ggml_get_type_traits_cpu(bank->gate->type)->vec_dot_type)->from_float;
+             for (int t = 0; t < jb.n_tokens; ++t) {
+@@ -272,10 +291,11 @@ struct executor {
+             if (v == answered || v % 2 == 0) {
+                 DMOE_PAUSE();
+                 continue;
+             }
+             const tosh_dmoe_job * jb = tosh_dmoe_job_of(v);
++            obs_n = 0;
+             if (tosh_dmoe_failed() == nullptr) {
+                 if (__atomic_load_n(&jb->value, __ATOMIC_ACQUIRE) != v) {
+                     tosh_dmoe_fail("the published value does not match its job");
+                 } else {
+                     try {
+@@ -285,10 +305,13 @@ struct executor {
+                     }
+                 }
+             }
+             answered = v;
+             tosh_dmoe_event_set(v + 1);
++            if (obs_n > 0) {
++                observe(observe_ctx, jb->il, obs_ids, obs_slots, obs_n, jb->n_tokens > 1, jb->tick);
++            }
+         }
+     }
+ 
+     // answers a publish nobody answered, so the GPU cannot wait forever
+     void watchdog_main() {
+@@ -313,10 +336,12 @@ struct executor {
+     }
+ 
+     void start() {
+         miss_by_layer   = std::vector<std::atomic<uint64_t>>(banks.size());
+         routed_by_layer = std::vector<std::atomic<uint64_t>>(banks.size());
++        hits_by_tick    = std::vector<std::atomic<uint32_t>>(1 << 16);
++        routed_by_tick  = std::vector<std::atomic<uint32_t>>(1 << 16);
+         for (int i = 1; i < n_threads; ++i) {
+             helpers.emplace_back(&executor::helper_main, this, i);
+         }
+         leader   = std::thread(&executor::leader_main, this);
+         watchdog = std::thread(&executor::watchdog_main, this);
+@@ -334,10 +359,28 @@ struct executor {
+         fprintf(stderr, "tosh_dmoe: host time per job %.1f us (quantize %.1f, gate/up %.1f, down %.1f)\n",
+                 (double) us_job.load()/n_jobs.load(), (double) us_quant.load()/n_jobs.load(),
+                 (double) us_p1.load()/n_jobs.load(), (double) us_p2.load()/n_jobs.load());
+         fprintf(stderr, "tosh_dmoe: host expert time %.3f ms total over %llu host experts (%.1f us each)\n",
+                 us_job.load()/1e3, (unsigned long long) m, m ? (double) us_job.load()/m : 0.0);
++        static const int edges[] = { 1, 9, 17, 33, 65, 129, 257, 513, 1 << 16 };
++        std::string line = "tosh_dmoe: hit rate by graph";
++        for (int b = 0; b + 1 < (int) (sizeof(edges)/sizeof(edges[0])); ++b) {
++            uint64_t h = 0, r = 0;
++            for (int t = edges[b]; t < edges[b + 1] && t < (int) hits_by_tick.size(); ++t) {
++                h += hits_by_tick[t]; r += routed_by_tick[t];
++            }
++            if (r) line += format(" | %d-%d %.1f%%", edges[b], edges[b + 1] - 1, 100.0*h/r);
++        }
++        fprintf(stderr, "%s\n", line.c_str());
++        if (const char * p = getenv("TOSH_DMOE_TRACE_HITS")) {
++            if (FILE * f = fopen(p, "w")) {
++                for (size_t t = 1; t < hits_by_tick.size(); ++t) {
++                    if (routed_by_tick[t]) fprintf(f, "%zu %u %u\n", t, hits_by_tick[t].load(), routed_by_tick[t].load());
++                }
++                fclose(f);
++            }
++        }
+         if (getenv("TOSH_DMOE_STATS_LAYERS")) {
+             for (size_t il = 0; il < banks.size(); ++il) {
+                 const uint64_t r = routed_by_layer[il].load();
+                 if (r) {
+                     fprintf(stderr, "tosh_dmoe: layer %2zu hit %.1f%%\n", il, 100.0*(double) (r - miss_by_layer[il].load())/r);
+@@ -345,35 +388,434 @@ struct executor {
+             }
+         }
+     }
+ };
+ 
++
++// Online residency: LFU with a lazy per-graph decay, promotion when the decayed count clears a
++// cost threshold, the lowest-scoring resident of the layer as victim. Slots move
++// FREE -> PENDING (upload in flight, not in any table) -> RESIDENT (published) -> RETIRING
++// (dropped from the next table) -> FREE once no graph can still read the old table.
++struct policy {
++    enum : uint8_t { FREE, PENDING, RESIDENT, RETIRING };
++
++    struct slot {
++        uint8_t  state  = FREE;
++        int32_t  e      = -1;
++        uint32_t gen    = 0;
++        uint64_t ticket = 0;
++        uint64_t retire_sync = UINT64_MAX;
++        uint32_t since  = 0;
++        uint32_t uses   = 0;
++        clk::time_point issued;
++    };
++
++    struct obs {
++        int16_t  e;
++        int16_t  slot;
++        uint8_t  multi;
++        uint32_t tick;
++    };
++
++    static constexpr uint32_t ring_size = 1 << 14;
++
++    int n_layer = 0, n_expert = 0, Q = 0;
++    float  decay  = 0.98f;
++    float  margin = 0.0f;
++    double admit_fixed = 0.0;   // 0: estimate from the running costs
++    int    budget = 8;
++    long   stop_after = -1;
++    bool   warm_prefill = true;
++    long   verify_every = 0;
++
++    std::vector<const llama_tosh_dmoe_layer *> layers;
++    const std::vector<host_bank> * banks = nullptr;
++    const tosh_dmoe_uploader * up = nullptr;
++
++    std::vector<float>    score;
++    std::vector<uint32_t> last_tick;
++    std::vector<int32_t>  resident_slot;
++    std::vector<uint8_t>  pending;
++    std::vector<uint32_t> evicted_tick;
++    std::vector<slot>     slots;
++    std::vector<std::vector<int>> free_list;
++    std::vector<int>      pending_slots;   // l*Q + s
++    std::vector<int>      retiring_slots;
++    std::vector<float>    pow_decay;
++
++    std::vector<std::vector<obs>> ring;
++    std::unique_ptr<std::atomic<uint32_t>[]> head, tail;
++
++    uint32_t budget_tick = 0;
++    int      issued_tick = 0;   // promotions issued for the current graph
++
++    int32_t * tables = nullptr;
++    int cur_version = 0;
++    uint64_t version_retired[TOSH_DMOE_VERSIONS] = {};
++    bool dirty = false;
++
++    std::thread th;
++    std::atomic<bool> stop{false};
++
++    // stats
++    std::atomic<uint64_t> dropped{0};
++    uint64_t n_cycles = 0, promotions = 0, evictions = 0, repromotions = 0, failed = 0, publishes = 0;
++    uint64_t bytes_promoted = 0, upload_done = 0, verified = 0, verify_bad = 0, stale_hits = 0;
++    double   us_cycle = 0, us_drain = 0, us_decide = 0, us_publish = 0, us_upload_call = 0;
++    double   us_upload_wall = 0, us_upload_gpu = 0;
++    uint64_t lifetime_sum = 0, lifetime_n = 0, uses_sum = 0;
++    std::vector<uint32_t> lifetimes;
++    std::vector<uint16_t> promo_by_tick = std::vector<uint16_t>(1 << 16);
++    double   t_cpu_expert_us = 0;
++    double   admit_used = 0;
++    const executor * ex = nullptr;
++
++    float decayed(size_t key, uint32_t now) const {
++        const uint32_t dt = now - last_tick[key];
++        return score[key]*(dt < pow_decay.size() ? pow_decay[dt] : 0.0f);
++    }
++
++    static void observe_cb(void * ctx, int il, const int32_t * ids, const int32_t * sl, int n, bool multi, uint32_t tick) {
++        auto * p = (policy *) ctx;
++        const uint32_t h = p->head[il].load(std::memory_order_relaxed);
++        const uint32_t t = p->tail[il].load(std::memory_order_acquire);
++        if (h - t + n > ring_size) {
++            p->dropped += n;
++            return;
++        }
++        auto & r = p->ring[il];
++        for (int i = 0; i < n; ++i) {
++            r[(h + i) & (ring_size - 1)] = { (int16_t) ids[i], (int16_t) sl[i], (uint8_t) multi, tick };
++        }
++        p->head[il].store(h + n, std::memory_order_release);
++    }
++
++    double admit_threshold() {
++        if (ex != nullptr && ex->n_miss.load() > 0) {
++            t_cpu_expert_us = (double) ex->us_job.load()/ex->n_miss.load();
++        }
++        if (admit_fixed > 0) return admit_fixed;
++        // expected reuse must pay the upload: T_upload / (T_cpu - T_gpu). This charges the stage
++        // copy as if it were serial, so it errs strict; the default is a fixed threshold.
++        if (upload_done < 16 || promotions == 0 || t_cpu_expert_us <= 10) return 1.8;
++        const double t_up = us_upload_gpu/upload_done + us_upload_call/promotions;
++        return std::max(1.0, t_up/(t_cpu_expert_us - 7.0));
++    }
++
++    bool verify_slot(int il, int s) {
++        const llama_tosh_dmoe_layer * dl = layers[il];
++        const host_bank & b = (*banks)[il];
++        const int e = slots[(size_t) il*Q + s].e;
++        bool ok = true;
++        for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
++            std::vector<uint8_t> got(arena->nb[2]);
++            ggml_backend_tensor_get(arena, got.data(), (size_t) s*arena->nb[2], got.size());
++            ok = ok && memcmp(got.data(), (const char *) bank->data + (size_t) e*bank->nb[2], got.size()) == 0;
++        }
++        return ok;
++    }
++
++    void cycle() {
++        const clk::time_point t0 = clk::now();
++        const uint64_t sync = tosh_dmoe_completed_value();
++        const uint32_t now  = (uint32_t) tosh_dmoe_tick();
++        n_cycles++;
++
++        // 1. observations since the last cycle
++        std::vector<std::pair<float, size_t>> cands;
++        for (int il = 0; il < n_layer; ++il) {
++            if (layers[il] == nullptr) continue;
++            const uint32_t h = head[il].load(std::memory_order_acquire);
++            uint32_t t = tail[il].load(std::memory_order_relaxed);
++            for (; t != h; ++t) {
++                const obs & o = ring[il][t & (ring_size - 1)];
++                const size_t key = (size_t) il*n_expert + o.e;
++                if (warm_prefill || !o.multi) {
++                    score[key] = decayed(key, o.tick) + 1.0f;
++                    last_tick[key] = o.tick;
++                }
++                if (o.slot >= 0) {
++                    // a hit must name the slot's occupant: slots are refilled only after every
++                    // graph that could read the old table has finished, long after its observation
++                    slot & sl = slots[(size_t) il*Q + o.slot];
++                    if (sl.e == o.e) sl.uses++; else stale_hits++;
++                } else if (resident_slot[key] < 0 && !pending[key]) {
++                    cands.push_back({ 0.0f, key });
++                }
++            }
++            tail[il].store(t, std::memory_order_release);
++        }
++        const clk::time_point t1 = clk::now();
++
++        // 2. uploads that landed become resident; failed ones free their slot
++        for (size_t i = 0; i < pending_slots.size();) {
++            const int gs = pending_slots[i];
++            slot & sl = slots[gs];
++            const int st = up->status(up->ctx, sl.ticket);
++            if (st == 0) { ++i; continue; }
++            const int il = gs / Q, s = gs % Q;
++            const size_t key = (size_t) il*n_expert + sl.e;
++            pending[key] = 0;
++            if (st == 1) {
++                sl.state = RESIDENT; sl.since = now; sl.uses = 0;
++                resident_slot[key] = s;
++                upload_done++;
++                us_upload_wall += std::chrono::duration<double, std::micro>(clk::now() - sl.issued).count();
++                us_upload_gpu  += up->gpu_us(up->ctx, sl.ticket);
++                if (verify_every > 0 && upload_done % verify_every == 0) {
++                    verified++;
++                    if (!verify_slot(il, s)) verify_bad++;
++                }
++                dirty = true;
++            } else {
++                failed++;
++                sl.state = FREE; sl.e = -1;
++                free_list[il].push_back(s);
++            }
++            pending_slots[i] = pending_slots.back();
++            pending_slots.pop_back();
++        }
++
++        // 3. retired slots nobody can still read
++        for (size_t i = 0; i < retiring_slots.size();) {
++            slot & sl = slots[retiring_slots[i]];
++            if (sl.retire_sync != UINT64_MAX && sync >= sl.retire_sync + 2) {
++                sl.state = FREE; sl.e = -1;
++                free_list[retiring_slots[i] / Q].push_back(retiring_slots[i] % Q);
++                retiring_slots[i] = retiring_slots.back();
++                retiring_slots.pop_back();
++            } else {
++                ++i;
++            }
++        }
++
++        // 4. admission and eviction
++        admit_used = admit_threshold();
++        const bool frozen = stop_after >= 0 && (long) now > stop_after;
++        if (!frozen && !cands.empty()) {
++            std::sort(cands.begin(), cands.end(), [](auto & a, auto & b) { return a.second < b.second; });
++            cands.erase(std::unique(cands.begin(), cands.end(), [](auto & a, auto & b) { return a.second == b.second; }), cands.end());
++            for (auto & c : cands) c.first = decayed(c.second, now);
++            std::sort(cands.begin(), cands.end(), [](auto & a, auto & b) { return a.first > b.first; });
++            if (now != budget_tick) {
++                budget_tick = now;
++                issued_tick = 0;
++            }
++            int retired = 0;
++            for (auto & [sc, key] : cands) {
++                if (sc < admit_used || issued_tick >= budget) break;
++                const int il = (int) (key / n_expert), e = (int) (key % n_expert);
++                if (resident_slot[key] >= 0 || pending[key]) continue;
++                if (free_list[il].empty()) {
++                    if (retired >= budget) continue;
++                    int victim = -1; float vs = 0;
++                    for (int s = 0; s < Q; ++s) {
++                        const slot & sl = slots[(size_t) il*Q + s];
++                        if (sl.state != RESIDENT) continue;
++                        const float v = decayed((size_t) il*n_expert + sl.e, now);
++                        if (victim < 0 || v < vs) { victim = s; vs = v; }
++                    }
++                    if (victim < 0 || vs + margin >= sc) continue;
++                    slot & sl = slots[(size_t) il*Q + victim];
++                    const size_t vkey = (size_t) il*n_expert + sl.e;
++                    resident_slot[vkey] = -1;
++                    evicted_tick[vkey] = now;
++                    lifetime_sum += now - sl.since; lifetime_n++; uses_sum += sl.uses;
++                    if (lifetimes.size() < (1 << 20)) lifetimes.push_back(now - sl.since);
++                    sl.state = RETIRING; sl.retire_sync = UINT64_MAX;
++                    retiring_slots.push_back(il*Q + victim);
++                    evictions++; retired++;
++                    dirty = true;
++                    continue;   // the candidate takes a slot once one frees
++                }
++                const int s = free_list[il].back();
++                free_list[il].pop_back();
++                slot & sl = slots[(size_t) il*Q + s];
++                const llama_tosh_dmoe_layer * dl = layers[il];
++                const host_bank & b = (*banks)[il];
++                tosh_dmoe_copy copies[3] = {
++                    { dl->arena_gate, (size_t) s*dl->arena_gate->nb[2], (const char *) b.gate->data + (size_t) e*b.gate->nb[2], dl->arena_gate->nb[2] },
++                    { dl->arena_up,   (size_t) s*dl->arena_up->nb[2],   (const char *) b.up->data   + (size_t) e*b.up->nb[2],   dl->arena_up->nb[2]   },
++                    { dl->arena_down, (size_t) s*dl->arena_down->nb[2], (const char *) b.down->data + (size_t) e*b.down->nb[2], dl->arena_down->nb[2] },
++                };
++                sl.e = e; sl.gen++; sl.issued = clk::now();
++                const clk::time_point tu = clk::now();
++                sl.ticket = up->upload(up->ctx, copies, 3);
++                us_upload_call += std::chrono::duration<double, std::micro>(clk::now() - tu).count();
++                if (sl.ticket == 0) {
++                    failed++;
++                    sl.state = FREE; sl.e = -1;
++                    free_list[il].push_back(s);
++                    continue;
++                }
++                sl.state = PENDING;
++                pending[key] = 1;
++                pending_slots.push_back(il*Q + s);
++                promotions++; issued_tick++;
++                if (now < promo_by_tick.size()) promo_by_tick[now]++;
++                bytes_promoted += copies[0].size + copies[1].size + copies[2].size;
++                if (evicted_tick[key] != 0 && now - evicted_tick[key] < 64) repromotions++;
++            }
++        }
++        const clk::time_point t2 = clk::now();
++
++        // 5. publish a table with what is resident now, into a version no graph can be reading
++        if (dirty) {
++            int next = -1;
++            for (int k = 1; k < TOSH_DMOE_VERSIONS; ++k) {
++                const int v = (cur_version + k) % TOSH_DMOE_VERSIONS;
++                if (sync >= version_retired[v] + 2) { next = v; break; }
++            }
++            if (next >= 0) {
++                for (int il = 0; il < n_layer; ++il) {
++                    if (layers[il] == nullptr) continue;
++                    int32_t * tb = tables + ((size_t) next*TOSH_DMOE_MAX_LAYERS + il)*n_expert;
++                    for (int e = 0; e < n_expert; ++e) tb[e] = -1;
++                    for (int s = 0; s < Q; ++s) {
++                        const slot & sl = slots[(size_t) il*Q + s];
++                        if (sl.state == RESIDENT) tb[sl.e] = s;
++                    }
++                }
++                std::atomic_thread_fence(std::memory_order_release);
++                tosh_dmoe_publish_version(next);
++                // counted after the switch: a graph submitted before it is done two syncs later,
++                // however many syncs passed while this cycle ran
++                const uint64_t sync_pub = tosh_dmoe_completed_value();
++                version_retired[cur_version] = sync_pub;
++                cur_version = next;
++                for (int gs : retiring_slots) {
++                    if (slots[gs].retire_sync == UINT64_MAX) slots[gs].retire_sync = sync_pub;
++                }
++                publishes++;
++                dirty = false;
++            }
++        }
++        const clk::time_point t3 = clk::now();
++        us_drain   += std::chrono::duration<double, std::micro>(t1 - t0).count();
++        us_decide  += std::chrono::duration<double, std::micro>(t2 - t1).count();
++        us_publish += std::chrono::duration<double, std::micro>(t3 - t2).count();
++        us_cycle   += std::chrono::duration<double, std::micro>(t3 - t0).count();
++    }
++
++    void main() {
++        uint64_t seen = tosh_dmoe_completed_value();
++        while (!stop.load()) {
++            tosh_dmoe_wait_completed(seen, 2000);
++            seen = tosh_dmoe_completed_value();
++            try {
++                cycle();
++            } catch (...) {
++                tosh_dmoe_fail("the residency policy threw");
++            }
++        }
++    }
++
++    void report(uint64_t graphs) {
++        const double g = std::max<uint64_t>(1, graphs);
++        int used = 0;
++        for (const slot & s : slots) used += s.state == RESIDENT;
++        std::sort(lifetimes.begin(), lifetimes.end());
++        fprintf(stderr, "tosh_dmoe: policy decay %.3f, admit %.2f (measured upload %.1f us wall, %.1f us gpu; cpu expert %.1f us), budget %d/graph, margin %.2f\n",
++                decay, admit_used, upload_done ? us_upload_wall/upload_done : 0.0, upload_done ? us_upload_gpu/upload_done : 0.0,
++                t_cpu_expert_us, budget, margin);
++        fprintf(stderr, "tosh_dmoe: per graph: promotions %.2f, evictions %.2f, MiB promoted %.2f | re-promotions %.1f%% | failed %llu, dropped obs %llu, hits on a changed slot %llu\n",
++                promotions/g, evictions/g, bytes_promoted/1048576.0/g, promotions ? 100.0*repromotions/promotions : 0.0,
++                (unsigned long long) failed, (unsigned long long) dropped.load(), (unsigned long long) stale_hits);
++        fprintf(stderr, "tosh_dmoe: slots %d of %d resident | evicted lifetime mean %.1f median %u graphs, uses per evicted residency %.1f\n",
++                used, (int) slots.size(), lifetime_n ? (double) lifetime_sum/lifetime_n : 0.0,
++                lifetimes.empty() ? 0u : lifetimes[lifetimes.size()/2], lifetime_n ? (double) uses_sum/lifetime_n : 0.0);
++        uint64_t live_uses = 0; int live = 0;
++        for (const slot & s : slots) if (s.state == RESIDENT) { live_uses += s.uses; live++; }
++        fprintf(stderr, "tosh_dmoe: uses per promotion (evicted + live) %.1f\n",
++                promotions ? (double) (uses_sum + live_uses)/promotions : 0.0);
++        fprintf(stderr, "tosh_dmoe: policy thread per graph %.1f us (drain %.1f, decide %.1f incl. upload calls %.1f, publish %.1f), %llu publishes, %llu cycles\n",
++                us_cycle/g, us_drain/g, us_decide/g, us_upload_call/g, us_publish/g, (unsigned long long) publishes, (unsigned long long) n_cycles);
++        if (const char * p = getenv("TOSH_DMOE_TRACE_PROMO")) {
++            if (FILE * f = fopen(p, "w")) {
++                for (size_t t = 1; t < promo_by_tick.size() && t <= graphs; ++t) fprintf(f, "%zu %u\n", t, promo_by_tick[t]);
++                fclose(f);
++            }
++        }
++        if (verify_every > 0) {
++            fprintf(stderr, "tosh_dmoe: verified %llu promoted slots against the host bank, %llu mismatched\n",
++                    (unsigned long long) verified, (unsigned long long) verify_bad);
++        }
++    }
++};
++
++static policy * g_policy = nullptr;
++
+ static executor * g_exec = nullptr;
+ 
++static ggml_backend_buffer_t g_arena_buf = nullptr;
++
+ static void dmoe_report_at_exit() {
+     if (g_exec && getenv("TOSH_DMOE_STATS")) {
+         g_exec->report();
++        if (g_policy) {
++            g_policy->report(tosh_dmoe_tick());
++        }
+     }
+ }
+ 
+ }
+ 
++void llama_tosh_dmoe_shutdown() {
++    if (g_policy != nullptr && g_policy->th.joinable()) {
++        g_policy->stop = true;
++        g_policy->th.join();
++    }
++    if (g_exec != nullptr) {
++        g_exec->stop = true;
++        for (auto & t : g_exec->helpers) if (t.joinable()) t.join();
++        if (g_exec->leader.joinable())   g_exec->leader.join();
++        if (g_exec->watchdog.joinable()) g_exec->watchdog.join();
++    }
++    // the stats stay for the exit report; the arena and the layer map go with the model
++    g_layers.clear();
++    if (g_arena_buf != nullptr) {
++        ggml_backend_buffer_free(g_arena_buf);
++        g_arena_buf = nullptr;
++    }
++}
++
+ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams) {
+-    const char * path = getenv("TOSH_DMOE_RESIDENCY");
+-    if (path == nullptr || g_exec != nullptr) {
++    const char * path      = getenv("TOSH_DMOE_RESIDENCY");
++    const char * cache_mib = getenv("TOSH_DMOE_CACHE_MIB");
++    if ((path == nullptr && cache_mib == nullptr) || g_exec != nullptr) {
+         return;
+     }
++    // a residency file pins the set; a cache size lets the policy fill it online
++    const bool dynamic = path == nullptr;
+ 
+-    std::ifstream f(path);
+-    if (!f) {
+-        throw std::runtime_error(format("TOSH_DMOE_RESIDENCY: cannot open %s", path));
+-    }
+     const int n_layer  = (int) layers.size();
+     const int n_expert = (int) hparams.n_expert;
+     std::vector<std::vector<int>> resident(n_layer);
+     std::vector<std::vector<int>> slot_of(n_layer, std::vector<int>(n_expert, -1));
+-    for (std::string line; std::getline(f, line);) {
++
++    int quota = 0;
++    if (dynamic) {
++        size_t per_expert_all_layers = 0;
++        for (const llama_layer & L : layers) {
++            if (L.ffn_gate_exps && L.ffn_up_exps && L.ffn_down_exps) {
++                per_expert_all_layers += L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
++            }
++        }
++        if (per_expert_all_layers == 0) {
++            throw std::runtime_error("TOSH_DMOE_CACHE_MIB: the model has no layer with separate gate, up and down expert banks");
++        }
++        quota = (int) std::min<size_t>((size_t) n_expert, (size_t) (atof(cache_mib)*1048576.0)/per_expert_all_layers);
++        if (quota < 1) {
++            throw std::runtime_error("TOSH_DMOE_CACHE_MIB: the cache is smaller than one expert per layer");
++        }
++    }
++
++    std::ifstream f(dynamic ? "" : path);
++    if (!dynamic && !f) {
++        throw std::runtime_error(format("TOSH_DMOE_RESIDENCY: cannot open %s", path));
++    }
++    for (std::string line; !dynamic && std::getline(f, line);) {
+         std::istringstream ls(line);
+         int il, e;
+         if (!(ls >> il >> e)) {
+             continue;
+         }
+@@ -413,11 +855,11 @@ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams
+         ex->n_embd = (int) L.ffn_gate_exps->ne[0];
+         ex->n_ff   = (int) L.ffn_gate_exps->ne[1];
+ 
+         llama_tosh_dmoe_layer dl;
+         dl.il      = il;
+-        dl.n_slots = (int) resident[il].size();
++        dl.n_slots = dynamic ? quota : (int) resident[il].size();
+         const int64_t ns = std::max(1, dl.n_slots);
+         dl.arena_gate = ggml_new_tensor_3d(ctx, L.ffn_gate_exps->type, L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], ns);
+         dl.arena_up   = ggml_new_tensor_3d(ctx, L.ffn_up_exps->type,   L.ffn_up_exps->ne[0],   L.ffn_up_exps->ne[1],   ns);
+         dl.arena_down = ggml_new_tensor_3d(ctx, L.ffn_down_exps->type, L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], ns);
+         dl.residency  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_expert);
+@@ -435,22 +877,23 @@ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams
+     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+     if (buf == nullptr) {
+         throw std::runtime_error("TOSH_DMOE_RESIDENCY: the VRAM arena does not fit");
+     }
+     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    g_arena_buf = buf;
+ 
+     size_t n_resident = 0;
+     for (auto & [il, dl] : made) {
+         const llama_layer & L = layers[il];
+-        for (int s = 0; s < dl.n_slots; ++s) {
++        for (int s = 0; s < (int) resident[il].size(); ++s) {
+             const int e = resident[il][s];
+             for (auto [bank, arena] : { std::pair{ L.ffn_gate_exps, dl.arena_gate }, { L.ffn_up_exps, dl.arena_up }, { L.ffn_down_exps, dl.arena_down } }) {
+                 ggml_backend_tensor_set(arena, (const char *) bank->data + (size_t) e*bank->nb[2], (size_t) s*arena->nb[2], arena->nb[2]);
+             }
+         }
+         ggml_backend_tensor_set(dl.residency, slot_of[il].data(), 0, sizeof(int32_t)*n_expert);
+-        n_resident += dl.n_slots;
++        n_resident += resident[il].size();
+         g_layers[L.ffn_gate_exps] = dl;
+     }
+ 
+     const char * nt = getenv("TOSH_DMOE_THREADS");
+     ex->n_threads = std::max(1, nt ? atoi(nt) : (int) std::thread::hardware_concurrency()/2);
+@@ -466,10 +909,69 @@ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams
+ 
+     if (ex->n_embd % executor::rows2 != 0 || ex->n_ff % executor::rows1 != 0) {
+         throw std::runtime_error("TOSH_DMOE_RESIDENCY: expert shape not divisible by the executor's row chunks");
+     }
+ 
++    if (dynamic) {
++        const size_t page = 16384;
++        const size_t bytes = ((size_t) TOSH_DMOE_VERSIONS*TOSH_DMOE_MAX_LAYERS*n_expert*sizeof(int32_t) + page - 1)/page*page;
++        void * tb = nullptr;
++        if (posix_memalign(&tb, page, bytes) != 0) {
++            throw std::runtime_error("TOSH_DMOE_CACHE_MIB: cannot allocate the residency tables");
++        }
++        memset(tb, 0xff, bytes);
++        tosh_dmoe_set_tables((int32_t *) tb, bytes, TOSH_DMOE_MAX_LAYERS, n_expert);
++        tosh_dmoe_publish_version(0);
++
++        auto * pol = new policy();
++        pol->n_layer  = n_layer;
++        pol->n_expert = n_expert;
++        pol->Q        = quota;
++        pol->tables   = (int32_t *) tb;
++        pol->banks    = &ex->banks;
++        pol->ex       = ex;
++        pol->up       = tosh_dmoe_get_uploader();
++        if (pol->up == nullptr) {
++            throw std::runtime_error("TOSH_DMOE_CACHE_MIB: the GPU backend offers no uploader");
++        }
++        auto envf = [](const char * k, double d) { const char * v = getenv(k); return v ? atof(v) : d; };
++        pol->decay        = (float) envf("TOSH_DMOE_DECAY", 0.98);
++        // a promotion costs about one reuse of token time, so 1.8 keeps a margin against churn
++        pol->admit_fixed  = envf("TOSH_DMOE_ADMIT", 1.8);
++        pol->margin       = (float) envf("TOSH_DMOE_MARGIN", 0.0);
++        // 0: no per-graph cap; the stage ring still bounds the uploads in flight
++        pol->budget       = (int) envf("TOSH_DMOE_BUDGET", 0);
++        if (pol->budget <= 0) pol->budget = n_layer*n_expert;
++        pol->stop_after   = (long) envf("TOSH_DMOE_PROMO_STOP", -1);
++        pol->warm_prefill = envf("TOSH_DMOE_WARM_PREFILL", 1) != 0;
++        pol->verify_every = (long) envf("TOSH_DMOE_VERIFY", 0);
++        pol->layers.assign(n_layer, nullptr);
++        pol->free_list.resize(n_layer);
++        for (auto & [il, dl] : made) {
++            pol->layers[il] = &g_layers[layers[il].ffn_gate_exps];
++            for (int s = quota - 1; s >= 0; --s) pol->free_list[il].push_back(s);
++        }
++        const size_t nk = (size_t) n_layer*n_expert;
++        pol->score.assign(nk, 0.0f);
++        pol->last_tick.assign(nk, 0);
++        pol->resident_slot.assign(nk, -1);
++        pol->pending.assign(nk, 0);
++        pol->evicted_tick.assign(nk, 0);
++        pol->slots.resize((size_t) n_layer*quota);
++        pol->pow_decay.resize(1 << 16);
++        for (size_t i = 0; i < pol->pow_decay.size(); ++i) pol->pow_decay[i] = powf(pol->decay, (float) i);
++        pol->ring.assign(n_layer, std::vector<policy::obs>(policy::ring_size));
++        pol->head.reset(new std::atomic<uint32_t>[n_layer]());
++        pol->tail.reset(new std::atomic<uint32_t>[n_layer]());
++        ex->observe     = policy::observe_cb;
++        ex->observe_ctx = pol;
++        g_policy = pol;
++        pol->th = std::thread(&policy::main, pol);
++        LLAMA_LOG_INFO("%s: dynamic residency, %d slots per layer, decay %.3f, budget %d promotions per graph\n",
++                __func__, quota, pol->decay, pol->budget);
++    }
++
+     g_exec = ex;
+     ex->start();
+     atexit(dmoe_report_at_exit);
+ 
+     LLAMA_LOG_INFO("%s: mixed expert execution on %zu layers, %zu resident experts, VRAM arena %.2f MiB, %d host threads\n",
+diff --git a/src/llama-tosh-dmoe.h b/src/llama-tosh-dmoe.h
+index e4cea0b24..3235c84c6 100644
+--- a/src/llama-tosh-dmoe.h
++++ b/src/llama-tosh-dmoe.h
+@@ -21,7 +21,10 @@ struct llama_tosh_dmoe_layer {
+ };
+ 
+ // Enabled by TOSH_DMOE_RESIDENCY=<file of "layer expert" lines>. No-op otherwise.
+ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams);
+ 
++// Stops the host executor and the residency policy before the model's buffers go away.
++void llama_tosh_dmoe_shutdown();
++
+ // The mixed-execution state for the layer whose gate bank is `gate_exps`, or null.
+ const llama_tosh_dmoe_layer * llama_tosh_dmoe_layer_of(const ggml_tensor * gate_exps);
+diff --git a/tosh-moe/tosh-dmoe.cpp b/tosh-moe/tosh-dmoe.cpp
+index 73b78129b..c69f89031 100644
+--- a/tosh-moe/tosh-dmoe.cpp
++++ b/tosh-moe/tosh-dmoe.cpp
+@@ -1,8 +1,9 @@
+ #include "tosh-dmoe.h"
+ 
+ #include <atomic>
++#include <cstdlib>
+ #include <chrono>
+ #include <condition_variable>
+ #include <mutex>
+ 
+ namespace {
+@@ -22,10 +23,29 @@ std::mutex              g_active_mutex;
+ std::condition_variable g_active_cv;
+ std::atomic<bool>       g_active{false};
+ 
+ std::atomic<const char *> g_failed{nullptr};
+ 
++int32_t *            g_tables = nullptr;
++size_t               g_tables_bytes = 0;
++int                  g_tables_layers = 0;
++int                  g_tables_experts = 0;
++std::atomic<int>     g_version{0};
++
++std::atomic<uint64_t> g_tick{0};
++std::atomic<uint64_t> g_completed{0};
++std::mutex              g_done_mutex;
++std::condition_variable g_done_cv;
++
++tosh_dmoe_uploader    g_uploader = {};
++std::atomic<bool>     g_has_uploader{false};
++
++}
++
++bool tosh_dmoe_enabled(void) {
++    static const bool on = getenv("TOSH_DMOE_RESIDENCY") != nullptr || getenv("TOSH_DMOE_CACHE_MIB") != nullptr;
++    return on;
+ }
+ 
+ void tosh_dmoe_set_stage(void * host, size_t layer_stride) {
+     g_stride.store(layer_stride);
+     g_stage.store((char *) host);
+@@ -51,10 +71,55 @@ void tosh_dmoe_event_set(uint64_t value) {
+         g_ev_set(g_ev, value);
+     }
+ }
+ 
+ uint64_t tosh_dmoe_next_value(void) { return g_value.fetch_add(2); }
++uint64_t tosh_dmoe_last_value(void) { return g_value.load() - 2; }
++
++void tosh_dmoe_set_tables(int32_t * host, size_t bytes, int n_layers, int n_expert) {
++    g_tables_bytes   = bytes;
++    g_tables_layers  = n_layers;
++    g_tables_experts = n_expert;
++    g_tables         = host;
++}
++
++int32_t * tosh_dmoe_tables(size_t * bytes, int * n_layers, int * n_expert) {
++    if (bytes)    *bytes    = g_tables_bytes;
++    if (n_layers) *n_layers = g_tables_layers;
++    if (n_expert) *n_expert = g_tables_experts;
++    return g_tables;
++}
++
++void tosh_dmoe_publish_version(int version) { g_version.store(version, std::memory_order_release); }
++int  tosh_dmoe_published_version(void)      { return g_version.load(std::memory_order_acquire); }
++
++uint64_t tosh_dmoe_tick_next(void) { return g_tick.fetch_add(1) + 1; }
++uint64_t tosh_dmoe_tick(void)      { return g_tick.load(); }
++
++void tosh_dmoe_mark_completed(void) {
++    {
++        std::lock_guard<std::mutex> lock(g_done_mutex);
++        g_completed.fetch_add(1);
++    }
++    g_done_cv.notify_all();
++}
++
++uint64_t tosh_dmoe_completed_value(void) { return g_completed.load(); }
++
++bool tosh_dmoe_wait_completed(uint64_t seen, int timeout_us) {
++    std::unique_lock<std::mutex> lock(g_done_mutex);
++    return g_done_cv.wait_for(lock, std::chrono::microseconds(timeout_us), [seen] { return g_completed.load() != seen; });
++}
++
++void tosh_dmoe_set_uploader(const tosh_dmoe_uploader * u) {
++    g_uploader = *u;
++    g_has_uploader.store(true);
++}
++
++const tosh_dmoe_uploader * tosh_dmoe_get_uploader(void) {
++    return g_has_uploader.load() ? &g_uploader : nullptr;
++}
+ 
+ tosh_dmoe_job * tosh_dmoe_job_of(uint64_t value) {
+     return &g_jobs[(value >> 1) % TOSH_DMOE_RING];
+ }
+ 
+diff --git a/tosh-moe/tosh-dmoe.h b/tosh-moe/tosh-dmoe.h
+index 7cb613fdf..10bd2ebf8 100644
+--- a/tosh-moe/tosh-dmoe.h
++++ b/tosh-moe/tosh-dmoe.h
+@@ -14,17 +14,20 @@ extern "C" {
+ #endif
+ 
+ #define TOSH_DMOE_MAX_LAYERS 128
+ #define TOSH_DMOE_MAX_TOKENS 8
+ #define TOSH_DMOE_RING       1024
++#define TOSH_DMOE_VERSIONS   4
+ 
+ struct tosh_dmoe_job {
+     uint64_t value;     // the publish value this job answers
+     int32_t  il;
+     int32_t  n_tokens;
+     int32_t  n_used;
+     int32_t  n_embd;
++    int32_t  version;   // residency table the GPU read, dynamic residency only
++    uint32_t tick;      // the graph it belongs to
+ };
+ 
+ // Stage layout of one layer, in bytes from the layer base.
+ static inline size_t tosh_dmoe_off_act  (int n_embd, int n_used) { (void) n_embd; (void) n_used; return 0; }
+ static inline size_t tosh_dmoe_off_ids  (int n_embd, int n_used) { (void) n_used; return (size_t) n_embd*TOSH_DMOE_MAX_TOKENS*4; }
+@@ -36,10 +39,13 @@ static inline size_t tosh_dmoe_off_out  (int n_embd, int n_used) {
+ static inline size_t tosh_dmoe_layer_stride(int n_embd, int n_used) {
+     const size_t o = tosh_dmoe_off_out(n_embd, n_used) + (size_t) n_embd*n_used*TOSH_DMOE_MAX_TOKENS*4;
+     return (o + 4095) & ~(size_t) 4095;
+ }
+ 
++// Whether mixed expert execution is configured for this process; nothing runs otherwise.
++bool tosh_dmoe_enabled(void);
++
+ // Set by the GPU backend.
+ void     tosh_dmoe_set_stage(void * host, size_t layer_stride);
+ void *   tosh_dmoe_stage_layer(int il);
+ void     tosh_dmoe_set_event(void * ev, uint64_t (*get)(void *), void (*set)(void *, uint64_t));
+ uint64_t tosh_dmoe_event_get(void);
+@@ -54,10 +60,44 @@ struct tosh_dmoe_job * tosh_dmoe_job_of(uint64_t value);
+ // The host executor only spins while a graph with mixed layers is in flight.
+ void tosh_dmoe_set_active(bool active);
+ bool tosh_dmoe_wait_active(int timeout_us);
+ bool tosh_dmoe_is_active(void);
+ 
++// Dynamic residency. The GPU reads residency from host memory laid out as
++// [TOSH_DMOE_VERSIONS][TOSH_DMOE_MAX_LAYERS][n_expert] int32; each graph takes the published version when it is
++// submitted, so a table never changes under a running token.
++void      tosh_dmoe_set_tables(int32_t * host, size_t bytes, int n_layers, int n_expert);
++int32_t * tosh_dmoe_tables(size_t * bytes, int * n_layers, int * n_expert);
++void      tosh_dmoe_publish_version(int version);
++int       tosh_dmoe_published_version(void);
++
++// Graphs are counted as they are submitted. The completed count grows at every synchronize,
++// which waits for every graph submitted before it; submissions and synchronizes come from one
++// thread, so whatever a table published before sync k named is no longer read after sync k + 2.
++uint64_t tosh_dmoe_tick_next(void);
++uint64_t tosh_dmoe_tick(void);
++void     tosh_dmoe_mark_completed(void);
++uint64_t tosh_dmoe_completed_value(void);
++uint64_t tosh_dmoe_last_value(void);
++bool     tosh_dmoe_wait_completed(uint64_t seen, int timeout_us);
++
++// Uploads host bytes into GPU tensors on a queue of their own, through a bounded stage.
++struct tosh_dmoe_copy {
++    const void * dst;       // ggml_tensor
++    size_t       offset;
++    const void * src;
++    size_t       size;
++};
++struct tosh_dmoe_uploader {
++    void *   ctx;
++    uint64_t (*upload)(void * ctx, const struct tosh_dmoe_copy * copies, int n);   // 0 on failure
++    int      (*status)(void * ctx, uint64_t ticket);    // 0 pending, 1 done, -1 failed
++    double   (*gpu_us)(void * ctx, uint64_t ticket);    // device time of a finished upload
++};
++void                              tosh_dmoe_set_uploader(const struct tosh_dmoe_uploader * u);
++const struct tosh_dmoe_uploader * tosh_dmoe_get_uploader(void);
++
+ // A failure latches until cleared: every later publish is answered at once so the GPU never
+ // waits forever, and the caller aborts the batch.
+ void         tosh_dmoe_fail(const char * why);
+ const char * tosh_dmoe_failed(void);
+ void         tosh_dmoe_clear_failure(void);
