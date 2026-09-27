@@ -40,5 +40,39 @@ without keeping them in RAM does not help at 8-10 GiB (they are reused later).
 Layout: each expert is 3 ranges (gate, up, down; 2 on Gemma 4), one per part tensor, 0.56 MiB
 each on Qwen; parts of one layer sit 1-3 MiB apart. No repack is needed for per-expert reads.
 
-Not yet done: GPT-OSS, Gemma 4 and GLM (traces for Qwen and GPT-OSS exist), a prototype that
-measures a real cold read against the model.
+Not yet done: GPT-OSS, Gemma 4 and GLM (traces for Qwen and GPT-OSS exist).
+
+## Engine prototype, Qwen3.6-35B-A3B (patch 0116, experimental)
+
+`TOSH_DMOE_HOST_CACHE_MIB=10240` with `DMOE_LOAD=none`: the loader leaves the expert bank unread,
+experts are read with `pread` into a locked RAM cache (one LRU pool per expert size), and the
+untouched bank pages are PROT_NONE so any reader that bypasses the cache faults. Exclusive with the
+VRAM arena: a promoted expert leaves RAM, an evicted one is read back asynchronously
+(`TOSH_DMOE_HOST_DEMOTE=read`, default; `copy` reads the arena back and blocks the policy thread
+6.3 ms per eviction, which halved promotions and dropped the VRAM hit from 80% to 67%). Demand
+reads go ahead of read-backs. `TOSH_DMOE_HOST_IO` readers (4 selected), `TOSH_DMOE_HOST_NOCACHE=1`
+reads past the page cache. Needs `GGML_OP_OFFLOAD_MIN_BATCH=9`.
+
+RX 6700 XT, 32 GB, 7.1 GiB arena; full bank = the same engine with the bank locked in RAM.
+
+| | full bank | 10 GiB cache | 8 GiB cache |
+|---|---:|---:|---:|
+| RSS | 18.59 GiB | 11.53 GiB | 9.51 GiB |
+| 8K, first prompt after load (3381 tok): TTFT | 5.88 s | 10.82 s | |
+| 8K decode 256 tok | 56.2 t/s | 55.4 t/s | |
+| 12 turns, decode over all turns | 48.9 t/s | 39.5-40.1 t/s | 35.6 t/s |
+| 12 turns, decode turns 5-11 | 21.2 ms | 22.6 ms | 25.5 ms |
+| 12 turns, 20-39 token prompts, turns 5-11 | 1328 ms | 2290-2614 ms | |
+| 2048-token decode (cold start) | 57.6 t/s | 47.3 t/s | |
+| 16K prompt at 32K ctx: TTFT | 36.2 s | 49.3 s | |
+| topic shift, 4 topics | 50.0 t/s | 31.3 t/s | |
+
+Correctness: top-1 99.6-100% and mean KL 3-4e-4 against the full bank (same size as run-to-run
+host/GPU reordering), 5175 promoted slots compared against the file with 0 mismatches, 0 hits on a
+changed slot. Real reads: 1.7-2.4 ms p50 per 1.7 MiB expert with or without the page cache, since
+loading the engine evicts most of the model file from it on this machine.
+
+Against the simulation (conv12, 10 GiB): prefill cold reads 7937 real vs 6696 simulated (+19%);
+decode cold reads 2.75/token vs 1.47 (1.9x) and 0.76/token in turns 5-11 against ~0 capacity
+misses simulated. Most of the cost left is first touches, which the simulation priced apart:
+a cold start pays about 2.4 reads per token for the first 2000 tokens.
