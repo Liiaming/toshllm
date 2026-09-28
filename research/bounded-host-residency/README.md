@@ -124,3 +124,29 @@ start time for TTFT almost one to one:
 | other workloads' profile, 12 GiB | 7.6 s | 7.25 s | 14.9 s |
 
 File-order reads of the same set: 6.2k merged reads instead of 21.6k, 3.64 against 3.58 GB/s.
+
+## Async VRAM -> RAM copies instead of rereads (patch 0118, experimental)
+
+`TOSH_DMOE_HOST_DEMOTE=gpu TOSH_DMOE_DOWN_STAGE=1 TOSH_DMOE_DOWN_QUEUE=own`: an expert leaving VRAM
+is blitted into a 64 x 2 MiB device-allocated ring on a queue of its own and copied into its RAM
+slot on a dispatch queue; the slot stays loading until then (requests wait for the copy, never for
+the file) and the VRAM slot is not reused before the copy finished. A failed or ring-full copy
+falls back to a background file read. `demote_bench.m` is the microbenchmark.
+
+Microbenchmark (RX 6700 XT): 1.69-1.95 MiB per copy, 130-165 us of GPU time, 12.5 GB/s, 5-7 us
+to enqueue, not slowed by and not slowing a compute queue. Wrapping the mlocked RAM cache itself
+with newBufferWithBytesNoCopy works in isolation, but in the engine the driver pages those wraps
+in and out: 1 GiB pieces gave copy p99 752 ms and 165 ms decode steps, 16 MiB pieces p99 35 ms;
+the staging ring gives p50 1 ms, p99 10-24 ms, at 0.2 ms of CPU copy per expert.
+
+Result (12 GiB, lazy drop, warmup + 12 turns): file rereads caused by VRAM evictions 30.5k -> 0
+(plus 2.5-3k ring-full fallbacks), file bytes 58.6 -> 12-22 GiB, yet short prefill 2858 ms (0117)
+-> 3156 ms and decode 22.3 -> 23.0 ms: no gain. Isolation at 17 GiB (capacity to spare): keeping
+the copy on promotion +12% short prefill, dropping it and rereading from the file +31%, dropping it
+and copying from VRAM +39% (full bank 2259 ms). The cost follows moving an expert back into RAM on
+every eviction, whatever the path; skipping prefill-time moves and running the copies off Metal's
+completion thread did not change it. Cause not found yet.
+
+`host_plan.py`: dry run of a generic host-RAM plan (full bank when it fits a reserve of
+max(6 GiB, 20% RAM) and the wire limit, else the largest safe RAM cache; below HOT + RAM cache =
+bank it streams every token and is not recommended).
