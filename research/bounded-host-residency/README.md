@@ -5,12 +5,18 @@ rest from the GGUF on demand (COLD, `pread`), instead of locking the whole bank?
 
 Not productized. Production Dynamic MoE still locks the full bank.
 
+Engine code in the series: `patches/llama/0106-experimental-bounded-host-expert-cache.patch`, the
+selected design only (RAM copy of a promoted expert kept last in line, background read-back of an
+evicted one, demand reads first, optional prewarm). The async VRAM copy and the inclusive modes
+below were removed from the series after they measured NO-GO; their patches (then 0118 and 0119)
+and tools are in this directory's git history.
+
 ## Tools
 
 - `trace.cpp` (`build.sh`): router trace per token and 512-token prefill chunk. `TRACE_VERIFY=N`
   checks the first N rows against the top-k of the router's contiguous scores;
   `TRACE_NEGATIVE_CONTROL=1` reads the view as contiguous on purpose and must fail.
-- `run_traces.sh`, `run_traces_subset.sh`: workloads in `workloads/`.
+- `run_traces.sh`: workloads in `workloads/`.
 - `geometry.py`: bank size, bytes per expert, file layout per GGUF.
 - `sim.py`: HOT (VRAM, the Dynamic MoE policy approximated) then WARM (RAM: lru or lfu,
   exclusive with VRAM) over a trace. First touches are reported apart from capacity misses.
@@ -42,7 +48,7 @@ each on Qwen; parts of one layer sit 1-3 MiB apart. No repack is needed for per-
 
 Not yet done: GPT-OSS, Gemma 4 and GLM (traces for Qwen and GPT-OSS exist).
 
-## Engine prototype, Qwen3.6-35B-A3B (patch 0116, experimental)
+## Engine prototype, Qwen3.6-35B-A3B (first version, now in patch 0106)
 
 `TOSH_DMOE_HOST_CACHE_MIB=10240` with `DMOE_LOAD=none`: the loader leaves the expert bank unread,
 experts are read with `pread` into a locked RAM cache (one LRU pool per expert size), and the
@@ -77,7 +83,7 @@ decode cold reads 2.75/token vs 1.47 (1.9x) and 0.76/token in turns 5-11 against
 misses simulated. Most of the cost left is first touches, which the simulation priced apart:
 a cold start pays about 2.4 reads per token for the first 2000 tokens.
 
-## WARM size, prefill attribution and prewarm (patch 0117, experimental)
+## WARM size, prefill attribution and prewarm (now in patch 0106)
 
 `ws.py` (working set per token window), `tl.py` (prefill attribution from `TOSH_DMOE_TIMELINE`),
 `summ.py` (bench log summary), `prewarm_list.py` (expert lists by trace frequency). `sim.py`
@@ -125,13 +131,13 @@ start time for TTFT almost one to one:
 
 File-order reads of the same set: 6.2k merged reads instead of 21.6k, 3.64 against 3.58 GB/s.
 
-## Async VRAM -> RAM copies instead of rereads (patch 0118, experimental)
+## Async VRAM -> RAM copies instead of rereads: NO-GO, removed
 
 `TOSH_DMOE_HOST_DEMOTE=gpu TOSH_DMOE_DOWN_STAGE=1 TOSH_DMOE_DOWN_QUEUE=own`: an expert leaving VRAM
 is blitted into a 64 x 2 MiB device-allocated ring on a queue of its own and copied into its RAM
 slot on a dispatch queue; the slot stays loading until then (requests wait for the copy, never for
 the file) and the VRAM slot is not reused before the copy finished. A failed or ring-full copy
-falls back to a background file read. `demote_bench.m` is the microbenchmark.
+falls back to a background file read. The microbenchmark went with the code.
 
 Microbenchmark (RX 6700 XT): 1.69-1.95 MiB per copy, 130-165 us of GPU time, 12.5 GB/s, 5-7 us
 to enqueue, not slowed by and not slowing a compute queue. Wrapping the mlocked RAM cache itself
@@ -151,13 +157,12 @@ completion thread did not change it. Cause not found yet.
 max(6 GiB, 20% RAM) and the wire limit, else the largest safe RAM cache; below HOT + RAM cache =
 bank it streams every token and is not recommended).
 
-## Inclusive VRAM/RAM residency (patch 0119, experimental)
+## Inclusive VRAM/RAM residency: NO-GO, removed
 
 `TOSH_DMOE_HOST_DROP`: what happens to the RAM copy of an expert promoted to VRAM. 1 frees it (0116),
 0 keeps it first in line for eviction (0117), 2 keeps it in place (inclusive), 3 keeps it in place
 only while its decayed use is under `TOSH_DMOE_HOST_KEEP_BELOW`. Copies held in both places count
-against the RAM budget; the report gives both-places, VRAM-only and RAM-only bytes. `incl.py`
-replays the same choices on a trace.
+against the RAM budget. Keep-last is now the only behaviour and the switch is gone.
 
 Trace (conv12, 12 GiB): exclusive 3.71 refills/token and no capacity misses; keep-last 2.58
 refills and none; inclusive 1.08 refills but 0.91 capacity misses/token; protecting copies of
