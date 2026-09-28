@@ -274,3 +274,37 @@ all four states, Gemma and GLM go bounded only with 10 GiB held. Bounded plans s
 prewarm: the first 3.4K prompt runs at 265-275 t/s against 563 and the first 2048 tokens at 46-47
 t/s against 59. Coverage near 1.0 is slow in steady state too (prefill 28% slower): 1.0 lets it run,
 it does not make it good.
+
+## Startup priming and the coverage gate (patch 0109, experimental)
+
+llama-server's warm-up is one decode of BOS and EOS (2 tokens) before the server is ready. With a
+bounded cache it reads about 600 Qwen experts (1.0 GiB) and 99% of them are used afterwards, but it
+lasts about 0.6 s: a fill limited to it loaded 0.1-0.2 GiB. The real window is the lock of the RAM
+cache: mlock zero-fills every page, 3-4 s for 15 GiB. 0109 starts the cache as soon as the loader
+knows the bank, locks it on its own thread, and meanwhile reads experts in file order into free
+slots (16 readers, published only when read, last in line for eviction, never evicting); the
+server waits for the lock and the fill stops at ready. Writing the pages with experts costs less
+than zeroing them, so ready does not move.
+
+Qwen, 14.8 GiB RAM cache (`srv_startup.py`, forced plan):
+
+| fill | ready | loaded before ready | first 3.4K prompt | first token |
+|---|---:|---:|---:|---:|
+| none | 9.08 s | 1.0 GiB (warm-up) | 289.6 t/s | 20.73 s |
+| 4 readers | 8.48 s | 6.1 GiB | 350.1 t/s | 18.12 s |
+| 8 readers | 8.68 s | 8.8 GiB | 382.8 t/s | 17.49 s |
+| 16 readers | 8.85 s | 10.4 GiB | 413.8 t/s | 17.01 s |
+
+Full host bank on the same machine: ready 14.7 s, 578 t/s, first token 20.5 s. With the moderate
+14.1 GiB plan in the bench the fill reached 12.1 GiB: first prompt 451.1 t/s against 275.3 cold,
+2048-token decode 54.65 t/s (p99 43.2 ms) against 47.24 (65.8 ms). GPT-OSS, Gemma and GLM bounded
+plans fill 1.9, 8.2 and 3.6 GiB the same way, 85-99% used afterwards.
+
+Coverage gate: GOOD >= 1.25, CONSTRAINED 1.0-1.25, rejected under 1.0. A gate at 1.10 was tried
+and dropped: Auto's fallback for Qwen with 10 GiB held (23 layers of experts on the host) ran the
+12-turn prefill at 234.2 t/s and chat decode at 28.9 t/s, against 337.0 and 42.9 for the 1.01
+bounded plan it would replace.
+
+Also fixed here: a plan taken by Auto crashed llama-server on 9-31 token prompts (the offload
+threshold and the cache switch had been read by the planner's probes before the plan set them),
+and 0108 did not build without Dynamic MoE.
