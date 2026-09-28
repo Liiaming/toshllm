@@ -32,9 +32,10 @@ def main():
         a['pre_cap'] += r['prefill_capacity']
         a['pre_cold'] += r['prefill_cold']
         a['hot'] += r['hot_hit'] * r['decode_tokens']
+        a['refill'] += r.get('refill_reads', 0)
     order = lambda w: 1e9 if w == 'full' else float(w)
     print('warm_gib policy bypass | rss_gib | decode: host hit, capacity reads/token, MiB/token, +ms serial, +ms overlapped, slowdown | '
-          'prefill: capacity MiB/ktok, +s/ktok, slowdown')
+          'prefill: capacity MiB/ktok, +s/ktok, slowdown | read-backs per token')
     for (w, pol, bp), a in sorted(agg.items(), key=lambda x: (order(x[0][0]), x[0][1], x[0][2])):
         tok = max(1, a['tok'])
         cap, layers = a['cap'] / tok, a['layers'] / tok
@@ -46,7 +47,7 @@ def main():
         rss = nonexpert + warm_gib + (0 if w == 'full' else STAGING_GIB)
         print(f"{w:>4} {pol:3s} {bp} | {rss:5.1f} | {a['hit'] / max(1, a['acc']):.3f} {cap:6.2f} {cap * xb_mib:6.2f} "
               f"{serial:6.2f} {overlap:6.2f} {overlap / base_ms * 100:5.1f}% | {pre_mib_k:8.0f} {pre_s_k:5.2f} "
-              f"{pre_s_k / (1000 / base_pp) * 100:6.1f}%")
+              f"{pre_s_k / (1000 / base_pp) * 100:6.1f}% | {a['refill'] / max(1, a['tok'] + a['pre_tok']):.2f}")
 
 
 if __name__ == '__main__':

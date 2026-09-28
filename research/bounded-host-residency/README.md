@@ -76,3 +76,51 @@ Against the simulation (conv12, 10 GiB): prefill cold reads 7937 real vs 6696 si
 decode cold reads 2.75/token vs 1.47 (1.9x) and 0.76/token in turns 5-11 against ~0 capacity
 misses simulated. Most of the cost left is first touches, which the simulation priced apart:
 a cold start pays about 2.4 reads per token for the first 2000 tokens.
+
+## WARM size, prefill attribution and prewarm (patch 0117, experimental)
+
+`ws.py` (working set per token window), `tl.py` (prefill attribution from `TOSH_DMOE_TIMELINE`),
+`summ.py` (bench log summary), `prewarm_list.py` (expert lists by trace frequency). `sim.py`
+now counts the read-backs that exclusivity costs (`refill_reads`): 3.7 per token on conv12,
+against 3.8 measured with lazy drop and 4.9 with the drop of 0116.
+
+Working set (traces): a 50-token prompt touches 7.2 GiB of experts, a 256-token window 11.4 GiB,
+the 3381-token prompt 15.8 GiB. HOT holds 6.5 GiB (97 slots x 40 layers), so HOT + WARM covers the
+whole 17.07 GiB bank from about 10.6 GiB of WARM: past that, capacity misses are not the cost.
+
+Warmup conversation + 12 turns, 4 readers, NVMe direct (F_NOCACHE):
+
+| WARM | RSS | steady prefill (9 short prompts) | decode after warmup | cold reads/token |
+|---:|---:|---:|---:|---:|
+| full bank | 18.6 | 2320 ms | 21.6 ms | 0 |
+| 10 | 11.5 | 4101 (+77%) | 24.3 | 2.17 |
+| 11 | 12.5 | 3932 (+69%) | 24.7 | 0.82 |
+| 12 | 13.5 | 3520 (+52%) | 23.1 | 0.31 |
+| 13 | 14.5 | 3431 (+48%) | 22.8 | 0.33 |
+| 12, boost + lazy drop | 13.5 | 2964 (+28%) | 22.4 | 0.34 |
+| 12, same + full prewarm | 13.5 | 2858 (+23%) | 22.3 | 0.16 |
+| 14, boost + lazy drop | 15.5 | 2725 (+17%) | 21.8 | 0.31 |
+| 17.1, lazy drop (no read-backs) | 18.6 | 2534 (+9%) | 22.6 | 0.25 |
+
+Where short-prefill time goes (main thread partitioned, residual within 3% of wall): demand reads
+are latency bound and serial per layer (routing is known only at each layer); demand waits behind
+queued read-backs (fixed by moving a read-back a demand waits on to the front: +52% -> +29%); with
+waits gone, about 19 points are the read-back traffic slowing the host executor and 9 points first
+touches and the pinning path. Read-backs are reused 92-94% before eviction, so skipping them loses
+(no read-backs: +58%, decode +27%); low-priority readers of their own starve them (+55%).
+More readers than 4 only saturate the NVMe. Adjacent cold experts are rare (1.02 per run), so
+merging demand reads saves nothing.
+
+First 3381-token prompt, 12 GiB: cold reads are 16.5 GiB whatever the WARM size. Prewarm trades
+start time for TTFT almost one to one:
+
+| prewarm | ready | TTFT | launch to first token |
+|---|---:|---:|---:|
+| full bank (no prewarm) | 11.9 s | 5.86 s | 17.8 s |
+| none | 4.4 s | 10.87 s | 15.3 s |
+| layer order, 12 GiB, file order | 8.5 s | 7.02 s | 15.5 s |
+| trace oracle 2 / 4 / 6 GiB | 4.8 / 5.3 / 6.0 s | 10.25 / 9.58 / 8.85 s | 15.1 / 14.9 / 14.8 s |
+| trace oracle, 12 GiB | 7.6 s | 6.97 s | 14.6 s |
+| other workloads' profile, 12 GiB | 7.6 s | 7.25 s | 14.9 s |
+
+File-order reads of the same set: 6.2k merged reads instead of 21.6k, 3.64 against 3.58 GB/s.

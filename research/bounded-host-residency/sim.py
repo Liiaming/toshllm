@@ -143,6 +143,9 @@ def simulate_warm(events, cap, policy, exclusive, prefill_bypass):
         k = (l, e)
         if kind == 'evict':
             if exclusive:
+                # the runtime reads it back from the file: storage traffic off the critical path
+                if k not in w.items:
+                    st['refill'] += 1
                 w.insert(k)
             continue
         if kind != 'promote':
@@ -219,6 +222,7 @@ def main():
                                 prefill_access=st['access_0'],
                                 reload_rate=round(st['reload'] / max(1, st['cold_0'] + st['cold_1']), 4),
                                 unique_cold=st['unique_cold'],
+                                refill_reads=st['refill'],
                                 uses_per_load=round(sum(w.uses_per_load) / max(1, len(w.uses_per_load)), 2),
                                 lifetime_p50=sorted(w.lifetimes)[len(w.lifetimes) // 2] if w.lifetimes else None,
                                 lifetime_p95=sorted(w.lifetimes)[int(len(w.lifetimes) * 0.95)] if w.lifetimes else None))
