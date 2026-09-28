@@ -206,3 +206,34 @@ Machines (with `host_plan.py`): 32 GiB and up keep the full bank. 24 GiB cannot 
 (RSS 18.6 against an 18 GiB budget) and gets about 16 GiB of RAM cache, the measured near-full
 point. 16 GiB gets about 8 GiB, where the earlier 8 GiB runs showed +20% steady decode and +211%
 on a long prompt: not recommended.
+
+## Other MoE models (patch 0107)
+
+0107 drops the Qwen-only gate: parts keep fixed places (0 gate or fused gate/up, 1 up, 2 down;
+a fused layout has no part 1 and its up rows follow gate inside part 0), biases and scales stay
+loaded, every size pool holds at least one layer's full expert set (Gemma's second size class had
+79 slots for 128 experts), and the generic expert copy in the scheduler and the routing-less bank
+upload take their bytes from the cache instead of the protected bank.
+
+At 8K on this 12 GiB card Auto picks Dynamic MoE for all four; a 24 GiB machine holds the whole
+bank of GPT-OSS, Gemma and GLM, so their bounded runs use a forced 16 GiB budget (RAM cache from
+`host_plan.py`: 8.4, 8.1 and 8.7 GiB), Qwen a forced 24 GiB one (16.3 GiB). `xmodel.py` prints the
+comparison. Real speeds, full bank first:
+
+| model | RSS full / bounded | 3.4K prompt t/s | 12-turn prefill t/s | 12-turn decode t/s | 2048 decode t/s | p99 ms |
+|---|---|---|---|---|---|---|
+| Qwen, 16.3 GiB | 18.6 / 17.5 | 563 / 508 | 471 / 451 | 46.0 / 44.1 | 58.9 / 57.0 | 27.5 / 30.3 |
+| GPT-OSS, 8.4 GiB | 10.5 / 9.5 | 735 / 718 | 586 / 586 | 70.4 / 65.0 | 89.3 / 89.2 | 16.7 / 16.8 |
+| Gemma 4, 8.1 GiB | 14.5 / 9.2 | 630 / 523 | n/a | n/a | 54.2 / 52.4 | 26.1 / 35.8 |
+| GLM, 8.7 GiB | 12.7 / 9.6 | 367 / 352 | 212 / 207 | 27.4 / 26.4 | 43.5 / 42.3 | 33.5 / 34.2 |
+
+Gemma has no multi-turn run: the bench cannot apply its chat template. Correctness: slot checks
+with 0 mismatches and 0 stale hits on all four, 0 non-finite logits; KL at run-to-run level for
+Qwen, GPT-OSS and GLM. Gemma bounded shows KL 1.1e-3 (top-1 98%): the full bank reproduces it when
+more rows go to the host (KL 1.7e-3 at a fixed threshold of 48), and bounded with room for the whole
+bank gives 2.1e-5, so it is the host path's arithmetic under a different host share, not the cache.
+
+Coverage (VRAM experts + RAM cache)/bank separates the results: 1.34-1.71 (Qwen 16.3, GLM,
+GPT-OSS) stay within 10% on representative prefill and 5% on long decode; 1.00-1.20 (Gemma, Qwen at
+12-14 GiB) lose 17-29% on prompts and more tail; under 1.0 (Qwen at 8 GiB) is not usable. Prewarm
+did not pay off end to end on any model (Qwen: 18.8 s to the first token with it, 17.4 s cold).
