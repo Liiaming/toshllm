@@ -150,3 +150,29 @@ completion thread did not change it. Cause not found yet.
 `host_plan.py`: dry run of a generic host-RAM plan (full bank when it fits a reserve of
 max(6 GiB, 20% RAM) and the wire limit, else the largest safe RAM cache; below HOT + RAM cache =
 bank it streams every token and is not recommended).
+
+## Inclusive VRAM/RAM residency (patch 0119, experimental)
+
+`TOSH_DMOE_HOST_DROP`: what happens to the RAM copy of an expert promoted to VRAM. 1 frees it (0116),
+0 keeps it first in line for eviction (0117), 2 keeps it in place (inclusive), 3 keeps it in place
+only while its decayed use is under `TOSH_DMOE_HOST_KEEP_BELOW`. Copies held in both places count
+against the RAM budget; the report gives both-places, VRAM-only and RAM-only bytes. `incl.py`
+replays the same choices on a trace.
+
+Trace (conv12, 12 GiB): exclusive 3.71 refills/token and no capacity misses; keep-last 2.58
+refills and none; inclusive 1.08 refills but 0.91 capacity misses/token; protecting copies of
+experts in VRAM 0 refills and 6.6 capacity misses/token. Duplicates average 2.6-6.0 GiB.
+
+Engine (warmup + 12 turns, short prefill against 2259 ms full bank):
+
+| RAM copy on promotion | 12 GiB | decode | 14 GiB |
+|---|---:|---:|---:|
+| keep last (0117) | 2933 (+30%) | 22.5 | 2725 (+21%) |
+| keep in place (inclusive) | 3650 (+62%) | 25.6 | 2826 (+25%) |
+| keep in place under score 4 | 3340 (+48%) | 24.0 | |
+| keep in place under score 16 | 3915 (+73%) | 28.2 | |
+
+At a fixed RAM budget a duplicate takes the place of an expert found nowhere else, so rereads in
+the background turn into misses on the critical path. The saving of the bounded cache is exactly
+not holding VRAM residents twice; keeping them all (the 17 GiB control, +12%) needs the full bank.
+Repeated bounded runs vary by up to 10% (full bank 3%).
