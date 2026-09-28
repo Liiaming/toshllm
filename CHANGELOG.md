@@ -15,6 +15,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **Images: Qwen-Image 2.1 generates from text about 40% faster.** On a Radeon RX 6700 XT at 1024x1024 a 25-step image takes 182 seconds instead of 314: each step goes from 11.6 to 6.6 seconds, and cards with 12 GB or more decode the result in larger tiles, 12.2 seconds instead of 19.9.
 
+### Fixed
+
+- **LLMs: the automatic memory plan now works with models split into several files, such as Qwen3.8 Flash Next.** On one Radeon Pro Vega II die it picks Dynamic MoE by itself and reads a 3,000-token prompt at 202 tokens a second, against 179 with the manual settings, and generates at the same 21.
+
+- **LLMs: when no memory plan fits, the engine refuses to load the model and says why.** Before, it could fall back to the default settings, fill the GPU and stop answering, as Gemma 4 26B-A4B did on a machine short of free memory.
+
 ## [0.87.10] - 2026-09-25
 
 ### Improved
