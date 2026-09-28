@@ -181,3 +181,28 @@ At a fixed RAM budget a duplicate takes the place of an expert found nowhere els
 the background turn into misses on the critical path. The saving of the bounded cache is exactly
 not holding VRAM residents twice; keeping them all (the 17 GiB control, +12%) needs the full bank.
 Repeated bounded runs vary by up to 10% (full bank 3%).
+
+## RAM knee with the selected design (patch 0106)
+
+Same runtime at every size, prewarm of the whole RAM cache in file order; `knee.py` builds the
+table. Loss is elapsed time against the full bank (short prefill: 9 prompts of 20-70 tokens after
+a warmup conversation; the throughput left is 1/(1+loss)).
+
+| RAM cache | RSS | saved | short prefill | 516 | 3381 | 12-turn prefill | decode | 2048 decode | p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| full bank 17.07 | 18.6 | 0 | 2290 ms | 1202 | 5466 | 8958 | 21.75 ms | 16.97 ms | 27.5 |
+| 12 GiB | 13.5 | 5.1 | +29% | +10% | +5% | +12% | +5.2% | +8.1% | 35.8 |
+| 14 GiB | 15.5 | 3.1 | +19% | +5% | +2% | +7% | +4.7% | +3.9% | 29.2 |
+| 15 GiB | 16.5 | 2.1 | +16% | +7% | +2% | +6% | +4.6% | +3.4% | 29.8 |
+| 16 GiB | 17.5 | 1.1 | +7% | +1% | 0% | +2% | -0.4% | +2.4% | 28.4 |
+| 16 GiB, no prewarm | 17.5 | 1.1 | +6% | +1% | +2% | +3% | -3.0% | +19.6% | 57.4 |
+
+Read-backs per token fall from 4.1 (12 GiB) to 0.85 (16 GiB); capacity misses are under 0.12 per
+token everywhere. The curve has no sharp knee: each GiB kept in RAM buys a few points of short
+prefill. Saving 3 GiB costs about 19% of short prefill (7% over the whole conversation); near-full
+speed needs 16 GiB, which saves 1.1 GiB. Without prewarm the first 2048 tokens pay +20% and p99 57 ms.
+
+Machines (with `host_plan.py`): 32 GiB and up keep the full bank. 24 GiB cannot hold it safely
+(RSS 18.6 against an 18 GiB budget) and gets about 16 GiB of RAM cache, the measured near-full
+point. 16 GiB gets about 8 GiB, where the earlier 8 GiB runs showed +20% steady decode and +211%
+on a long prompt: not recommended.
