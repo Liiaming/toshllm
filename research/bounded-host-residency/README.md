@@ -237,3 +237,40 @@ Coverage (VRAM experts + RAM cache)/bank separates the results: 1.34-1.71 (Qwen 
 GPT-OSS) stay within 10% on representative prefill and 5% on long decode; 1.00-1.20 (Gemma, Qwen at
 12-14 GiB) lose 17-29% on prompts and more tail; under 1.0 (Qwen at 8 GiB) is not usable. Prewarm
 did not pay off end to end on any model (Qwen: 18.8 s to the first token with it, 17.4 s cold).
+
+## Runtime RAM-aware host plan (patch 0108, experimental)
+
+`TOSH_AUTO_HOST_POLICY=runtime` makes Auto plan host memory from the machine's state at load, not
+from installed RAM alone. Every cap is memory this load may still add:
+
+- reclaimable = free + speculative + purgeable + min(inactive, file-backed) pages
+  (`host_statistics64`; inactive anonymous pages need the compressor or swap, so they do not count)
+- static cap = RAM - max(6 GiB, 20% RAM) - this process's RSS
+- dynamic cap = reclaimable - clamp(15% RAM, 4 GiB, 12 GiB)
+- lockable = `vm.user_wire_limit` - wired - 1 GiB, for the locked bank or RAM cache only
+- effective = min(static, dynamic); pressure from `kern.memorystatus_vm_pressure_level` plus swap
+  written during a 0.4 s sample (swap left from before does not count)
+
+The whole bank is taken only with NORMAL pressure when engine + bank fit the effective cap and the
+bank fits the lockable one; otherwise the RAM cache is min(bank, effective - engine - staging,
+lockable), halved under ELEVATED pressure, none under CRITICAL, and a DMoE candidate needs
+(arena + cache)/bank >= 1.0. Reason codes: FULL_HOST_SAFE, FULL_HOST_STATIC_LIMIT,
+FULL_HOST_CURRENT_RAM_LIMIT, FULL_HOST_WIRE_LIMIT, HOST_MEMORY_PRESSURE_HIGH, BOUNDED_HOST_SELECTED
+(_BORDERLINE under 1.3), BOUNDED_HOST_COVERAGE_TOO_LOW, BOUNDED_HOST_CURRENT_RAM_TOO_LOW,
+HOST_MEMORY_LOCK_LIMIT. Without the switch the plan is unchanged. `runtime_sweep.py` compares
+headroom formulas offline; `memhold.c` holds touched memory to put the machine in a known state.
+
+This 32 GiB machine, Qwen at 8K (other load held by memhold):
+
+| state | reclaimable | plan | RAM cache | coverage | 12-turn prefill t/s | 12-turn decode t/s |
+|---|---:|---|---:|---:|---:|---:|
+| light | 26.6 GiB | full host bank | 17.1 | 1.41 | 470.6 | 46.0 |
+| 6 GiB held | 20.6 | bounded | 14.1 | 1.23 | 420.6 | 43.8 |
+| 10 GiB held | 16.8 | bounded | 10.4 | 1.01 | 337.0 | 42.9 |
+| released | 26.6 | full host bank | 17.1 | 1.41 | | |
+
+No swap was written and pressure stayed normal during these runs. GPT-OSS stays on the full bank in
+all four states, Gemma and GLM go bounded only with 10 GiB held. Bounded plans start without
+prewarm: the first 3.4K prompt runs at 265-275 t/s against 563 and the first 2048 tokens at 46-47
+t/s against 59. Coverage near 1.0 is slow in steady state too (prefill 28% slower): 1.0 lets it run,
+it does not make it good.
