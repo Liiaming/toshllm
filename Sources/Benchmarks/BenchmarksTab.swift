@@ -1387,6 +1387,14 @@ private struct BenchmarkResultTableRow: View, Equatable {
                                 .background(Color.appAccent.opacity(0.13), in: Capsule())
                                 .fixedSize()
                         }
+                        if let dmoe = result.dynamicMoeLabel {
+                            Image(systemName: "memorychip")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Color.chartSecondary)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(Color.chartSecondary.opacity(0.13), in: Capsule())
+                                .help(loc.t("Medido con %@", "Measured with %@", dmoe))
+                        }
                     }
                     Text(result.date, format: .dateTime.day().month().hour().minute())
                         .font(.caption2).foregroundStyle(.tertiary)
@@ -1452,7 +1460,9 @@ private struct BenchmarkResultTableRow: View, Equatable {
         if let accept = result.accept {
             values.append("MTP \(Int((accept * 100).rounded()))%")
         }
-        if let dmoe = result.dmoeK, dmoe > 0 {
+        if let dynamic = result.dynamicMoeLabel {
+            values.append(dynamic)
+        } else if let dmoe = result.dmoeK, dmoe > 0 {
             values.append("dMoE K\(dmoe)")
         } else if result.ncmoe > 0 {
             values.append("ncmoe \(result.ncmoe)")
@@ -1516,7 +1526,7 @@ private struct BenchmarkOutputCard: View {
                         "Hide the output and show system information again."))
         }) {
             ScrollViewReader { proxy in
-                ScrollView([.horizontal, .vertical]) {
+                ScrollView(.vertical) {
                     Text(buffer.text.isEmpty ? "…" : buffer.text)
                         .font(.system(size: 10.5, design: .monospaced))
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1583,6 +1593,11 @@ private struct BenchHistoryRow: View, Equatable {
                         .help(r.quantization == "—"
                               ? loc.t("El resultado antiguo no guardó el quant", "This older result did not store its quant")
                               : loc.t("Quantización del modelo", "Model quantization"))
+                    if let dmoe = r.dynamicMoeLabel {
+                        Image(systemName: "memorychip")
+                            .font(.system(size: 9)).foregroundStyle(Color.chartSecondary)
+                            .help(loc.t("Medido con %@", "Measured with %@", dmoe))
+                    }
                     if r.shared == true {
                         Image(systemName: "globe")
                             .font(.system(size: 9)).foregroundStyle(Color.appAccent)

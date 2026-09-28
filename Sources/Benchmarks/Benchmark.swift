@@ -58,9 +58,8 @@ struct BenchResult: Codable, Identifiable {
         if let ppN, let tgN, ppN != 512 || tgN != 128 { parts.append("pp\(ppN)/tg\(tgN)") }
         if let depth, depth > 0 { parts.append("d\(depth)") }
         if let accept { parts.append("MTP \(Int((accept * 100).rounded()))%") }
-        if let dynamicMoe {
-            parts.append(dynamicMoe == "dmoe_bounded" ? "Dynamic MoE · RAM" : dynamicMoe == "legacy_offload"
-                         ? "Dynamic MoE · ncmoe \(ncmoe)" : "Dynamic MoE")
+        if let dynamicMoeLabel {
+            parts.append(dynamicMoeLabel)
         } else if let dmoeK, dmoeK > 0 {
             parts.append("dMoE K\(dmoeK)")
         } else if ncmoe > 0 {
@@ -72,6 +71,15 @@ struct BenchResult: Codable, Identifiable {
         if peer == true { parts.append("IF Link") }
         if let engine, engine != "bundled" { parts.append(engine) }
         return parts.isEmpty ? "base" : parts.joined(separator: " · ")
+    }
+
+    var dynamicMoeLabel: String? {
+        guard let dynamicMoe else { return nil }
+        switch dynamicMoe {
+        case "dmoe_bounded": return "Dynamic MoE · RAM"
+        case "legacy_offload": return "Dynamic MoE · ncmoe \(ncmoe)"
+        default: return "Dynamic MoE"
+        }
     }
 
     var faLabel: String? {
@@ -106,7 +114,20 @@ final class BenchmarkOutputBuffer: ObservableObject {
         flushTask?.cancel()
         flushTask = nil
         pending = ""
-        text = value
+        text = Self.readable(value)
+    }
+
+    /// llama-bench echoes the expert override regex as a table cell; show what it means instead.
+    nonisolated static func readable(_ value: String) -> String {
+        guard value.contains(ServerSettings.expertsOnHostOverride) else { return value }
+        let cell = "| " + ServerSettings.expertsOnHostOverride
+        return value.split(separator: "\n", omittingEmptySubsequences: false).map { line in
+            guard line.hasPrefix("|"), let range = line.range(of: cell) else { return String(line) }
+            var rest = line[range.upperBound...]
+            while rest.first == " " { rest.removeFirst() }
+            let label = "Dynamic MoE".padding(toLength: 21, withPad: " ", startingAt: 0)
+            return String(line[..<range.lowerBound]) + "| " + label + " " + String(rest)
+        }.joined(separator: "\n")
     }
 
     func append(_ value: String) {
@@ -115,7 +136,7 @@ final class BenchmarkOutputBuffer: ObservableObject {
         flushTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(80))
             guard let self, !Task.isCancelled else { return }
-            text += pending
+            text = Self.readable(text + pending)
             pending = ""
             flushTask = nil
         }

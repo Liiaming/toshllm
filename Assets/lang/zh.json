@@ -903,6 +903,7 @@
   "Measure performance on your hardware.": "在你的硬件上测量性能。",
   "Measured result": "实测结果",
   "Measured suggestion: %@ keys, %@ values": "实测建议：键 %@，值 %@",
+  "Measured with %@": "使用 %@ 测得",
   "Measurements from the current session.": "当前会话的测量数据。",
   "Measures pp%@ (prompt) and tg%@ (generation), 2 repetitions. Takes minutes on large models.": "测量 pp%@（读取提示词）和 tg%@（生成），重复 2 次。大模型上需要几分钟。",
   "Measuring configurations": "正在测量各项配置",

@@ -903,6 +903,7 @@
   "Measure performance on your hardware.": "Misura le prestazioni sul tuo hardware.",
   "Measured result": "Risultato misurato",
   "Measured suggestion: %@ keys, %@ values": "Suggerimento misurato: chiavi %@, valori %@",
+  "Measured with %@": "Misurato con %@",
   "Measurements from the current session.": "Misurazioni della sessione corrente.",
   "Measures pp%@ (prompt) and tg%@ (generation), 2 repetitions. Takes minutes on large models.": "Misura pp%@ (prompt) e tg%@ (generazione), 2 ripetizioni. Sui modelli grandi richiede minuti.",
   "Measuring configurations": "Configurazioni di misurazione",

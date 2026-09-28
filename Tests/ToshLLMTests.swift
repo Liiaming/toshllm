@@ -1012,6 +1012,16 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertNil(plan.product)
     }
 
+    func testBenchmarkOutputNamesTheExpertOverride() {
+        let header = "| model | ot                    |         lm |            test |"
+        let row = "| qwen35moe | " + ServerSettings.expertsOnHostOverride + " |      mlock |           pp512 |"
+        let shown = BenchmarkOutputBuffer.readable(header + "\nargs: -ot " + ServerSettings.expertsOnHostOverride + "\n" + row)
+        let lines = shown.components(separatedBy: "\n")
+        XCTAssertEqual(lines[2], "| qwen35moe | Dynamic MoE           |      mlock |           pp512 |")
+        XCTAssertEqual(lines[2].count, lines[0].count + "qwen35moe".count - "model".count)
+        XCTAssertTrue(lines[1].contains(ServerSettings.expertsOnHostOverride))
+    }
+
     func testDynamicMoeBenchmarkFollowsThePlan() throws {
         let model = FileManager.default.temporaryDirectory
             .appendingPathComponent("tosh-bench-plan-\(UUID().uuidString).gguf")

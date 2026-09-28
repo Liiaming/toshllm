@@ -903,6 +903,7 @@
   "Measure performance on your hardware.": "お使いのハードウェアで性能を測定します。",
   "Measured result": "計測結果",
   "Measured suggestion: %@ keys, %@ values": "実測による推奨: キー %@、値 %@",
+  "Measured with %@": "%@ で計測",
   "Measurements from the current session.": "現在のセッションの測定値。",
   "Measures pp%@ (prompt) and tg%@ (generation), 2 repetitions. Takes minutes on large models.": "pp%@（プロンプト）と tg%@（生成）を 2 回ずつ測定します。大きなモデルでは数分かかります。",
   "Measuring configurations": "構成を計測中",

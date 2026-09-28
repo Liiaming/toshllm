@@ -903,6 +903,7 @@
   "Measure performance on your hardware.": "",
   "Measured result": "",
   "Measured suggestion: %@ keys, %@ values": "",
+  "Measured with %@": "",
   "Measurements from the current session.": "",
   "Measures pp%@ (prompt) and tg%@ (generation), 2 repetitions. Takes minutes on large models.": "",
   "Measuring configurations": "",
