@@ -7,15 +7,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **LLMs: Dynamic MoE, an experimental mode for Mixture-of-Experts models that do not fit in VRAM, off by default.** Turn it on in Settings → Performance & Memory; off, MoE models keep the standard expert offload as before. The engine keeps the most used experts in VRAM and the rest in RAM, sized for the context you ask for and for the memory the Mac has free right now, and shows the plan before the model starts. On a Radeon RX 6700 XT with the whole expert bank in RAM, Qwen3.6-35B-A3B reads a 3,400-token prompt at 581 tokens a second instead of 311 and generates at 43.8 instead of 29.0; GPT-OSS 20B reads at 902 instead of 497 and generates at 68.1 instead of 40.7. Models with a built-in MTP head keep using it; a separate DFlash draft only runs when the whole model fits on the GPU.
+- **LLMs: Dynamic MoE, an experimental mode for Mixture-of-Experts models that do not fit in VRAM, off by default.** Turn it on in Settings → Performance & Memory. On a Radeon RX 6700 XT, Qwen3.6-35B-A3B reads prompts at 581 tokens a second instead of 311 and generates at 43.8 instead of 29.0, keeping its MTP head.
 
-- **LLMs: with little free RAM, Dynamic MoE keeps only part of the expert bank in memory and reads the rest from the model file.** It fills that memory while the model loads, so the first prompt is not cold. With 8 GB taken by other apps, Qwen3.6-35B-A3B runs in 13 GB of RAM instead of 22, reading a prompt at 366 tokens a second and generating at 31. Models split into several files, such as Qwen3.8 Flash Next, are planned and read as a whole.
+- **LLMs: with little free RAM, Dynamic MoE keeps only part of the expert bank in memory and reads the rest from the model file.** With 8 GB taken by other apps, Qwen3.6-35B-A3B runs in 13 GB of RAM instead of 22, reading a prompt at 366 tokens a second and generating at 31.
 
 ### Improved
 
 - **LLMs: the context menus offer 128k, 256k, 512k and 1M when the model supports them.** The choices stop at the context each model was trained for, which the model details and the server page now show.
 
-- **Images: Qwen-Image 2.1 edits with reference images take about a quarter of the time.** The text and reference part of the prompt is computed once per image instead of at every step: on a Radeon RX 6700 XT at 1024x1024 a step with one reference goes from 28.5 to 7.9 seconds, and with two from 43.9 to 9.1, so a 25-step edit with two references takes under 5 minutes instead of about 19. On cards with 8 GB the reference edit falls back to the previous speed when this does not fit.
+- **Images: Qwen-Image 2.1 edits with reference images take about a quarter of the time.** On a Radeon RX 6700 XT at 1024x1024, a 25-step edit with two references takes under 5 minutes instead of about 19; cards with 8 GB keep the previous speed.
 
 - **Images: Qwen-Image 2.1 generates from text about 40% faster.** On a Radeon RX 6700 XT at 1024x1024 a 25-step image takes 182 seconds instead of 314: each step goes from 11.6 to 6.6 seconds, and cards with 12 GB or more decode the result in larger tiles, 12.2 seconds instead of 19.9.
 
