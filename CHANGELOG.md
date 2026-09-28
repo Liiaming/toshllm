@@ -7,7 +7,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **LLMs: Dynamic MoE keeps a MoE model's most used experts in VRAM and the rest in RAM, chosen automatically for the context you ask for.** It keeps about 1 GiB of VRAM free and shows the plan before loading. On a Radeon RX 6700 XT Qwen3.6-35B-A3B generates 47 tokens a second at 8K and 32K instead of about 31 with experts on the CPU, and Gemma 4 26B-A4B 40 at 8K instead of 21.
+- **LLMs: Dynamic MoE (experimental, off by default) keeps a MoE model's most used experts in VRAM and the rest in RAM, sized for the context you ask for and for the memory the Mac has free right now.** Turn it on in Settings; off, MoE models keep the standard expert offload. It keeps about 1 GiB of VRAM free, shows the plan before loading, and does not load a model that would not fit safely. On a Radeon RX 6700 XT Qwen3.6-35B-A3B generates 47 tokens a second at 8K and 32K instead of about 31 with experts on the CPU, and Gemma 4 26B-A4B 40 at 8K instead of 21.
 
 ### Improved
 
@@ -17,9 +17,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **LLMs: the automatic memory plan now works with models split into several files, such as Qwen3.8 Flash Next.** On one Radeon Pro Vega II die it picks Dynamic MoE by itself and reads a 3,000-token prompt at 202 tokens a second, against 179 with the manual settings, and generates at the same 21.
+- **LLMs: Dynamic MoE now works with models split into several files, such as Qwen3.8 Flash Next.** On one Radeon Pro Vega II die it picks Dynamic MoE by itself and reads a 3,000-token prompt at 202 tokens a second, against 179 with the manual settings, and generates at the same 21.
 
-- **LLMs: with the automatic memory plan, long chats no longer push a Mixture-of-Experts model into swap.** The plan now leaves room for the conversation state the server keeps in memory: Gemma 4 26B-A4B on a 32 GB Mac wrote 2 GB to swap during a long chat and now writes none.
+- **LLMs: with Dynamic MoE, long chats no longer push a Mixture-of-Experts model into swap.** The plan now leaves room for the conversation state the server keeps in memory: Gemma 4 26B-A4B on a 32 GB Mac wrote 2 GB to swap during a long chat and now writes none.
 
 - **LLMs: when no memory plan fits, the engine refuses to load the model and says why.** Before, it could fall back to the default settings, fill the GPU and stop answering, as Gemma 4 26B-A4B did on a machine short of free memory.
 

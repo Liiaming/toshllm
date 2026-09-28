@@ -32,10 +32,7 @@ struct Profile: Codable, Identifiable {
     var reasoningInline: Bool? = nil
     var parallelSlots: Int? = nil
     var faAmd: Bool? = nil
-    var dynamicMoe: Bool? = nil
-    var dynamicMoeSlots: Int? = nil
-    var dynamicMoePrefetch: Int? = nil
-    var dynamicMoePolicy: String? = nil
+    var dynamicMoeEnabled: Bool? = nil
     var persistCache: Bool? = nil
     var multiGPU: Bool? = nil
     // Split knobs optional for backward compatibility with profiles saved before they existed.
@@ -166,10 +163,7 @@ final class ProfileStore: ObservableObject {
         if let inline = p.reasoningInline { d.set(inline, forKey: SettingsKeys.reasoningInline) }
         if let slots = p.parallelSlots { d.set(slots, forKey: SettingsKeys.parallelSlots) }
         if let v = p.faAmd { d.set(v, forKey: SettingsKeys.faAmd) }
-        if let v = p.dynamicMoe { d.set(v, forKey: SettingsKeys.dynamicMoe) }
-        if let v = p.dynamicMoeSlots { d.set(v, forKey: SettingsKeys.dynamicMoeSlots) }
-        if let v = p.dynamicMoePrefetch { d.set(v, forKey: SettingsKeys.dynamicMoePrefetch) }
-        if let v = p.dynamicMoePolicy { d.set(v, forKey: SettingsKeys.dynamicMoePolicy) }
+        if let v = p.dynamicMoeEnabled { d.set(v, forKey: SettingsKeys.dynamicMoeEnabled) }
         if let v = p.persistCache { d.set(v, forKey: SettingsKeys.persistCache) }
         if let v = p.multiGPU { d.set(v, forKey: SettingsKeys.multiGPU) }
         if let v = p.multiGPUCount { d.set(v, forKey: SettingsKeys.multiGPUCount) }
@@ -237,8 +231,7 @@ extension ServerSettings {
                 cacheTypeV: cacheTypeV, mlock: mlock, port: port, specMTP: specMTP,
                 engine: engineTag, cacheRAM: cacheRAM, reasoningInline: reasoningInline,
                 parallelSlots: parallelSlots, faAmd: faAmd,
-                dynamicMoe: dynamicMoe, dynamicMoeSlots: dynamicMoeSlots,
-                dynamicMoePrefetch: dynamicMoePrefetch, dynamicMoePolicy: dynamicMoePolicy,
+                dynamicMoeEnabled: dynamicMoeEnabled,
                 persistCache: persistCache,
                 multiGPU: multiGPU, multiGPUCount: multiGPUCount,
                 splitMode: splitMode, splitGroupSize: splitGroupSize,
@@ -266,10 +259,7 @@ extension ServerSettings {
         if let v = p.parallelSlots { parallelSlots = v }
         if let v = p.faAmd { faAmd = v }
         if let v = p.ubatch { ubatch = v }
-        if let v = p.dynamicMoe { dynamicMoe = v }
-        if let v = p.dynamicMoeSlots { dynamicMoeSlots = v }
-        if let v = p.dynamicMoePrefetch { dynamicMoePrefetch = v }
-        if let v = p.dynamicMoePolicy { dynamicMoePolicy = v }
+        if let v = p.dynamicMoeEnabled { dynamicMoeEnabled = v }
         if let v = p.persistCache { persistCache = v }
         if let v = p.multiGPU { multiGPU = v }
         if let v = p.multiGPUCount { multiGPUCount = v }

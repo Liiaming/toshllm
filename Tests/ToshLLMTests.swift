@@ -342,35 +342,6 @@ final class WhisperTranscriptTests: XCTestCase {
     }
 }
 
-final class DynamicMoeOptimizationTests: XCTestCase {
-    func testCandidateSlotsFollowEachModelsExpertCount() {
-        let qwen = DynamicMoeModelInfo(layerCount: 40, expertCount: 256, activeExpertCount: 8)
-        XCTAssertEqual(BenchmarkController.dynamicMoeCandidateSlots(model: qwen, maximum: 75),
-                       [8, 16, 32, 64, 75])
-        XCTAssertEqual(BenchmarkController.dynamicMoeCandidateSlots(model: qwen, maximum: 132),
-                       [8, 16, 32, 64, 76], "automatic profiling must not approach a full bank")
-
-        let gptOSS = DynamicMoeModelInfo(layerCount: 24, expertCount: 32, activeExpertCount: 4)
-        XCTAssertEqual(BenchmarkController.dynamicMoeCandidateSlots(model: gptOSS, maximum: 32),
-                       [4, 8, 9])
-    }
-
-    func testHotMapValidatorAcceptsLegacyAndAdaptiveCounts() throws {
-        let directory = FileManager.default.temporaryDirectory
-        let legacy = directory.appendingPathComponent("tosh-dmoe-legacy-\(UUID().uuidString).map")
-        let adaptive = directory.appendingPathComponent("tosh-dmoe-adaptive-\(UUID().uuidString).map")
-        defer {
-            try? FileManager.default.removeItem(at: legacy)
-            try? FileManager.default.removeItem(at: adaptive)
-        }
-        try "0 2 0 3 1\n".write(to: legacy, atomically: true, encoding: .utf8)
-        try "0 2:91 0:47 3:12 1:1\n".write(to: adaptive, atomically: true, encoding: .utf8)
-
-        XCTAssertTrue(BenchmarkController.dynamicMoeHotMapIsValid(legacy, expertCount: 4))
-        XCTAssertTrue(BenchmarkController.dynamicMoeHotMapIsValid(adaptive, expertCount: 4))
-    }
-}
-
 // MARK: - Memory estimator
 
 final class EstimatorTests: XCTestCase {
@@ -999,18 +970,24 @@ final class ServerSettingsTests: XCTestCase {
         s.modelPath = model.path
         s.ubatch = 2048
         s.cacheTypeK = "q8_0"
-        s.autoMemoryPlan = true
+        XCTAssertFalse(s.usesAutoPlan, "Dynamic MoE is opt-in")
+        XCTAssertNil(s.environment["TOSH_AUTO"])
+        XCTAssertFalse(s.arguments.contains("--dynamic-moe"))
+        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--n-cpu-moe")! + 1], "24", "off keeps the standard offload")
+        s.dynamicMoeEnabled = true
 
         XCTAssertTrue(s.usesAutoPlan)
-        XCTAssertEqual(s.environment["TOSH_AUTO"], "1")
+        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--dynamic-moe")! + 1], "on")
+        XCTAssertNil(s.environment["TOSH_AUTO"], "the switch is the flag; TOSH_AUTO stays a developer override")
         XCTAssertEqual(s.environment["TOSH_AUTO_KV"], "auto")
         XCTAssertEqual(s.environment["TOSH_AUTO_PLAN_FILE"], AutoMemoryPlan.planURL(port: s.port).path)
         XCTAssertFalse(s.arguments.contains("--n-cpu-moe"), "the plan decides the offload")
         XCTAssertFalse(s.arguments.contains("--ubatch-size"), "the plan decides the batch")
         XCTAssertFalse(s.arguments.contains("-ctk"), "the plan decides the cache type")
         XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "-fa")! + 1], "1")
-        XCTAssertFalse(s.effectiveDynamicMoe, "the older cache stays off under the plan")
 
+        s.executionMode = "dmoe"
+        XCTAssertEqual(s.environment["TOSH_AUTO"], "dmoe")
         s.planWithoutDMoE = true
         XCTAssertEqual(s.environment["TOSH_AUTO"], "nodmoe")
 
@@ -1032,130 +1009,27 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(plan.nCtx, 32768)
         XCTAssertEqual(plan.candidates.first?.freeMib, 260)
         XCTAssertTrue(AutoMemoryText.summary(plan, runtime: nil).contains("Dynamic MoE"))
+        XCTAssertNil(plan.product)
     }
 
-    func testDynamicMoeIsCompiledButRequiresPrivateUIFlagAndToggle() throws {
-        let model = FileManager.default.temporaryDirectory
-            .appendingPathComponent("tosh-dynamic-moe-\(UUID().uuidString).gguf")
-        try writeMinimalMoEGGUF(model)
-        defer { try? FileManager.default.removeItem(at: model) }
-        var s = makeSettings()
-        s.modelPath = model.path
-        s.dynamicMoe = true
-        s.dynamicMoeSlots = 16
-        s.dynamicMoePrefetch = 7
-
-        XCTAssertFalse(s.effectiveDynamicMoe)
-        XCTAssertNil(s.environment["TOSH_MOE_MODE"])
-        XCTAssertFalse(s.arguments.contains("-ot"))
-        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--n-cpu-moe")! + 1], "24")
-
-        s.extraArgs = "TOSH_MOE_UI=1 TOSH_MOE_SLOTS=999"
-
-        XCTAssertTrue(s.effectiveDynamicMoe)
-        XCTAssertEqual(s.environment["TOSH_MOE_MODE"], "cache")
-        XCTAssertEqual(s.environment["TOSH_MOE_SLOTS"], "16")
-        XCTAssertEqual(s.environment["TOSH_MOE_CPU_BANK"], "1")
-        XCTAssertEqual(s.environment["GGML_SCHED_PREFETCH_EXPERTS"], "7")
-        XCTAssertEqual(s.environment["GGML_METAL_NCB"], "8")
-        XCTAssertFalse(s.arguments.contains("--n-cpu-moe"), "the cache decides the split on its own")
-        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--load-mode")! + 1], "mlock")
-        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "-ot")! + 1],
-                       ServerSettings.dynamicMoeTensorOverride)
-        XCTAssertFalse(s.benchmarkArguments.contains("-ncmoe"))
-        XCTAssertEqual(s.benchmarkArguments[s.benchmarkArguments.firstIndex(of: "-ot")! + 1],
-                       ServerSettings.dynamicMoeTensorOverride)
-
-        s.routerMode = true
-        XCTAssertFalse(s.effectiveDynamicMoe, "router presets cannot carry the tensor override")
-        XCTAssertNil(s.environment["TOSH_MOE_MODE"])
-    }
-
-    func testDynamicMoeAutoSelectsCacheOnlyWhenItProvidesAUsefulFit() {
-        let gib = UInt64(1024 * 1024 * 1024)
-        func route(
-            isMoE: Bool = true,
-            modelGB: UInt64 = 12,
-            vramMB: Int = 12_288,
-            reserveMB: Int = 1_024,
-            ramGB: UInt64 = 32,
-            hasDiscreteGPU: Bool = true,
-            splitOrRouter: Bool = false
-        ) -> DynamicMoeAutoRoute {
-            ServerSettings.resolveDynamicMoeAuto(
-                isMoE: isMoE,
-                modelBytes: modelGB * gib,
-                gpuVRAMMB: vramMB,
-                reserveMB: reserveMB,
-                physicalRAMBytes: ramGB * gib,
-                hasDiscreteGPU: hasDiscreteGPU,
-                splitOrRouter: splitOrRouter)
+    func testAutoMemoryPlanDecodesTheProductSchema() throws {
+        func plan(_ mode: String, _ legacy: String, _ state: String, _ coverage: String, _ extra: String = "") throws -> AutoMemoryPlan {
+            let json = #"{"plan_schema_version": 1, "product": {"mode": "\#(mode)", "mode_label_key": "plan.mode.x", "reason": "CURRENT_RAM_LIMIT", "warnings": ["COVERAGE_CONSTRAINED"], "limits": [], "limiting_resource": "HOST_RAM", "fallback": {"selected": true, "type": "PLAN_BOUNDED_DMOE"}, "memory": {"physical_bytes": 34359738368, "reclaimable_bytes": 20000000000, "projected_rss_bytes": 15000000000, "projected_vram_bytes": 10000000000}, "dmoe": {"expert_bank_bytes": 18000000000, "hot_bytes": 7000000000, "warm_bytes": 14000000000, "coverage": 1.12, "coverage_state": "\#(coverage)"}, "runtime": {"context": 8192, "kv_type": "f16", "kv_bytes": 400000000, "ubatch": 1024, "ncmoe_layers": 0}\#(extra)}, "state": "\#(state)", "mode": "\#(legacy)", "reason": "r", "fallback": "", "kv": "f16", "n_ctx": 8192, "ubatch": 1024, "ncmoe": 0, "reserve_mib": 975, "arena_mib": 7000, "min_arena_mib": 546, "projected_private_mib": 10000, "projected_free_mib": 975, "vram_total_mib": 12266, "vram_free_mib": 11960, "host_required_mib": 15000, "host_ram_mib": 32768, "host_available_mib": 26000, "host_reserve_mib": 8192, "bank_mib": 17000, "mlock": "required", "dispersion": "high", "candidates": []}"#
+            return try XCTUnwrap(AutoMemoryPlan.decode(Data(json.utf8)))
         }
-
-        // 12 GiB does not fit in 12 GiB VRAM after the 1 GiB user reserve and
-        // 512 MiB runtime margin, while 32 GiB RAM can safely pin its bank.
-        XCTAssertEqual(route(), .cache)
-        XCTAssertEqual(route(modelGB: 8), .normalFitsVRAM)
-        XCTAssertEqual(route(ramGB: 14), .normalInsufficientRAM)
-        XCTAssertEqual(route(isMoE: false), .normalDense)
-        XCTAssertEqual(route(hasDiscreteGPU: false), .normalUnsupportedGPU)
-        XCTAssertEqual(route(splitOrRouter: true), .normalSplitOrRouter)
-        XCTAssertEqual(ServerSettings.resolveDynamicMoeAuto(
-            isMoE: true, modelBytes: 0, gpuVRAMMB: 12_288, reserveMB: 1_024,
-            physicalRAMBytes: 32 * gib, hasDiscreteGPU: true, splitOrRouter: false),
-                       .normalMissingModel)
-    }
-
-    func testDynamicMoeSlotsFollowEachModelsMetadataAndVRAMBudget() throws {
-        let gib = UInt64(1024 * 1024 * 1024)
-        func plan(gb: Double, layers: Int, experts: Int, active: Int) throws -> DynamicMoeSlotPlan {
-            try XCTUnwrap(ServerSettings.resolveDynamicMoeSlots(
-                modelBytes: UInt64(gb * Double(gib)),
-                model: DynamicMoeModelInfo(layerCount: layers, expertCount: experts,
-                                           activeExpertCount: active),
-                gpuVRAMMB: 12_288, reserveMB: 1_024, prefetch: 4))
-        }
-
-        let qwen = try plan(gb: 11.44, layers: 40, experts: 256, active: 8)
-        XCTAssertEqual(qwen.automaticSlots, 8)
-        XCTAssertEqual(qwen.minimumSlots, 8)
-        XCTAssertEqual(qwen.maximumSlots, 256)
-        XCTAssertGreaterThanOrEqual(qwen.recommendedMaximumSlots, 114)
-
-        let gptOSS = try plan(gb: 11.0, layers: 24, experts: 32, active: 4)
-        XCTAssertEqual(gptOSS.automaticSlots, 4)
-        XCTAssertEqual(gptOSS.maximumSlots, 32)
-        XCTAssertEqual(gptOSS.clamped(114), 32)
-
-        let olmoe = try plan(gb: 4.5, layers: 16, experts: 64, active: 8)
-        XCTAssertEqual(olmoe.automaticSlots, 8)
-        XCTAssertEqual(olmoe.maximumSlots, 64)
-        XCTAssertEqual(olmoe.clamped(4), 8)
-    }
-
-    func testDynamicMoeAutoRejectsAWorkingSetSmallerThanTopK() {
-        let gib = UInt64(1024 * 1024 * 1024)
-        XCTAssertNil(ServerSettings.resolveDynamicMoeSlots(
-            modelBytes: 11 * gib,
-            model: DynamicMoeModelInfo(layerCount: 24, expertCount: 32,
-                                       activeExpertCount: 16),
-            gpuVRAMMB: 3_072, reserveMB: 1_024, prefetch: 4))
-    }
-
-    func testDynamicMoeAutoKeepsDirectMetalBankInsideSystemRAM() {
-        let gib = UInt64(1024 * 1024 * 1024)
-        // 32 GiB host: a 11.44 GiB model leaves a 10.1 GiB bank, which ran fine; the 19.45 GiB
-        // one leaves 18.2 GiB and starved the machine.
-        XCTAssertTrue(ServerSettings.dynamicMoeHostBankFitsDirectMetal(
-            modelBytes: UInt64(11.44 * Double(gib)), gpuVRAMMB: 12_288,
-            physicalRAMBytes: 32 * gib))
-        XCTAssertFalse(ServerSettings.dynamicMoeHostBankFitsDirectMetal(
-            modelBytes: UInt64(19.45 * Double(gib)), gpuVRAMMB: 12_288,
-            physicalRAMBytes: 32 * gib))
-        // the same model on a 192 GiB bench has room for it
-        XCTAssertTrue(ServerSettings.dynamicMoeHostBankFitsDirectMetal(
-            modelBytes: UInt64(19.45 * Double(gib)), gpuVRAMMB: 32_752,
-            physicalRAMBytes: 192 * gib))
+        let bounded = try plan("PLAN_BOUNDED_DMOE", "dmoe_bounded", "DMOE_BOUNDED_HOST", "CONSTRAINED")
+        XCTAssertEqual(bounded.planSchemaVersion, 1)
+        XCTAssertTrue(bounded.usesDynamicMoE)
+        XCTAssertEqual(bounded.productState, .memoryConstrained)
+        XCTAssertEqual(bounded.product?.dmoe.warmBytes, 14000000000)
+        XCTAssertEqual(try plan("PLAN_BOUNDED_DMOE", "dmoe_bounded", "DMOE_BOUNDED_HOST", "GOOD").productState, .boundedHost)
+        XCTAssertEqual(try plan("PLAN_FULL_HOST_DMOE", "dmoe", "DMOE_CAPACITY_REQUIRED", "GOOD").productState, .fullHost)
+        XCTAssertEqual(try plan("PLAN_CLASSIC_NCMOE", "legacy_offload", "LEGACY_OFFLOAD_BETTER", "").productState, .classicFallback)
+        let refused = try plan("PLAN_UNSUPPORTED", "none", "UNSUPPORTED", "",
+                               #", "unsupported": {"required_host_bytes": 11000000000, "available_host_bytes": 9000000000, "required_vram_bytes": 5000000000, "available_vram_bytes": 12000000000}"#)
+        XCTAssertEqual(refused.productState, .cannotLoad)
+        XCTAssertTrue(refused.isUnsupported)
+        XCTAssertEqual(refused.product?.unsupported?.requiredHostBytes, 11000000000)
     }
 
     func testAgentToolsArgumentsAreEmittedExactlyOnce() {
@@ -2454,20 +2328,6 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(loc.t("hola", "hello"), "hello")
     }
 
-    func testDynamicMoeOptimizationStatesUseActiveLanguage() {
-        let loc = Localizer()
-        loc.language = "es"
-        XCTAssertEqual(DynamicMoeOptimizationState.testingDirect(slots: 8).localized(using: loc),
-                       "Probando dMoE directo K8…")
-        XCTAssertEqual(DynamicMoeOptimizationState.optimizedSplit(slots: 64, ringSlots: 8)
-            .localized(using: loc), "Optimizado: ruta dividida K64 + ring8")
-
-        loc.language = "en"
-        XCTAssertEqual(DynamicMoeOptimizationState.testingDirect(slots: 8).localized(using: loc),
-                       "Testing direct dMoE K8…")
-        XCTAssertEqual(DynamicMoeOptimizationState.optimizedSplit(slots: 64, ringSlots: 8)
-            .localized(using: loc), "Optimized: split route K64 + ring8")
-    }
 }
 
 // MARK: - Shell-words parsing

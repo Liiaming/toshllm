@@ -21,6 +21,52 @@ struct AutoMemoryPlan: Decodable, Equatable {
         let arenaMib: Double
     }
 
+    /// The engine's stable view of the plan (schema 1): codes and bytes, no sentences.
+    struct Product: Decodable, Equatable {
+        struct Memory: Decodable, Equatable {
+            let physicalBytes: Int64
+            let reclaimableBytes: Int64
+            let projectedRssBytes: Int64
+            let projectedVramBytes: Int64
+        }
+        struct DMoE: Decodable, Equatable {
+            let expertBankBytes: Int64
+            let hotBytes: Int64
+            let warmBytes: Int64
+            let coverage: Double
+            let coverageState: String
+        }
+        struct Runtime: Decodable, Equatable {
+            let context: Int
+            let kvType: String
+            let kvBytes: Int64
+            let ubatch: Int
+            let ncmoeLayers: Int
+        }
+        struct Unsupported: Decodable, Equatable {
+            let requiredHostBytes: Int64
+            let availableHostBytes: Int64
+            let requiredVramBytes: Int64
+            let availableVramBytes: Int64
+        }
+        let mode: String
+        let modeLabelKey: String
+        let reason: String
+        let warnings: [String]
+        let limitingResource: String
+        let memory: Memory
+        let dmoe: DMoE
+        let runtime: Runtime
+        let unsupported: Unsupported?
+    }
+
+    /// What the user sees: the five Dynamic MoE outcomes, plus a model that fits whole.
+    enum ProductState: Equatable {
+        case fullGPU, fullHost, boundedHost, memoryConstrained, classicFallback, cannotLoad
+    }
+
+    let planSchemaVersion: Int?
+    let product: Product?
     let state: String
     let mode: String
     let reason: String
@@ -40,7 +86,19 @@ struct AutoMemoryPlan: Decodable, Equatable {
     let candidates: [Candidate]
 
     var isUnsupported: Bool { state == "UNSUPPORTED" }
-    var usesDynamicMoE: Bool { mode == "dmoe" }
+    var usesDynamicMoE: Bool { mode == "dmoe" || mode == "dmoe_bounded" }
+
+    var productState: ProductState {
+        switch product?.mode ?? "" {
+        case "PLAN_FULL_GPU": return .fullGPU
+        case "PLAN_FULL_HOST_DMOE": return .fullHost
+        case "PLAN_BOUNDED_DMOE": return product?.dmoe.coverageState == "GOOD" ? .boundedHost : .memoryConstrained
+        case "PLAN_CLASSIC_NCMOE": return .classicFallback
+        case "PLAN_UNSUPPORTED": return .cannotLoad
+        default:
+            return isUnsupported ? .cannotLoad : mode == "legacy_offload" ? .classicFallback : mode == "full_gpu" ? .fullGPU : .fullHost
+        }
+    }
 
     static func planURL(port: Int) -> URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -112,6 +170,26 @@ struct AutoMemoryRuntime: Decodable, Equatable {
     }
 }
 
+/// How the load that followed the plan ended, with measured memory next to the projection.
+struct AutoMemoryActual: Decodable, Equatable {
+    let loadResult: String
+    let detail: String
+    let runtimeCode: String
+    let mode: String
+    let projectedRssBytes: Int64
+    let actualRssBytes: Int64
+    let actualFootprintBytes: Int64
+    let projectedVramBytes: Int64
+    let actualVramBytes: Int64
+
+    static func read(port: Int) -> AutoMemoryActual? {
+        let d = JSONDecoder()
+        d.keyDecodingStrategy = .convertFromSnakeCase
+        let url = URL(fileURLWithPath: AutoMemoryPlan.planURL(port: port).path + ".actual")
+        return (try? Data(contentsOf: url)).flatMap { try? d.decode(AutoMemoryActual.self, from: $0) }
+    }
+}
+
 /// User-facing wording for a plan. Rounded numbers: the exact MiB belong to diagnostics.
 enum AutoMemoryText {
     private static func t(_ es: String, _ en: String) -> String {
@@ -135,6 +213,7 @@ enum AutoMemoryText {
         switch mode {
         case "full_gpu": return t("GPU completa", "Full GPU")
         case "dmoe": return "Dynamic MoE"
+        case "dmoe_bounded": return t("Dynamic MoE (RAM limitada)", "Dynamic MoE (bounded RAM)")
         case "legacy_offload": return t("Expertos en CPU", "Expert offload")
         default: return t("Sin configuración válida", "No valid configuration")
         }
@@ -146,6 +225,10 @@ enum AutoMemoryText {
         if plan.usesDynamicMoE {
             let arena = runtime.map { $0.isOn ? $0.arenaMib : 0 } ?? plan.arenaMib
             parts.append(t("\(gib(arena)) de caché de expertos", "\(gib(arena)) expert cache"))
+            if let p = plan.product, p.dmoe.warmBytes > 0 {
+                parts.append(t("\(gib(Double(p.dmoe.warmBytes)/1048576)) en RAM", "\(gib(Double(p.dmoe.warmBytes)/1048576)) in RAM"))
+            }
+            if plan.productState == .memoryConstrained { parts.append(t("memoria justa", "memory constrained")) }
         } else if plan.mode == "legacy_offload" {
             parts.append(t("\(plan.ncmoe) capas de expertos en CPU", "\(plan.ncmoe) expert layers on CPU"))
         }
@@ -170,12 +253,24 @@ enum AutoMemoryText {
         case "DMOE_CAPACITY_REQUIRED":
             s = t("Dynamic MoE: el modelo no cabe en VRAM; la GPU guarda los expertos más usados.",
                   "Dynamic MoE: the model does not fit in VRAM; the GPU keeps the most used experts.")
+        case "DMOE_BOUNDED_HOST":
+            s = t("Dynamic MoE con RAM limitada: la memoria libre ahora no da para todo el banco de expertos; la RAM guarda los más usados y el resto se lee del archivo del modelo.",
+                  "Dynamic MoE with bounded RAM: free memory right now cannot hold the whole expert bank; RAM keeps the most used experts and the rest are read from the model file.")
         case "LEGACY_OFFLOAD_BETTER":
             s = t("Expertos en CPU: Dynamic MoE no está disponible para este modelo o esta máquina.",
                   "Expert offload: Dynamic MoE is not available for this model or machine.")
         default:
-            s = t("Ninguna configuración deja un margen de VRAM seguro con este contexto; reduce el contexto.",
-                  "No configuration leaves a safe VRAM margin at this context; lower the context.")
+            if let u = plan.product?.unsupported {
+                let need = { (b: Int64) in gib(Double(b)/1048576) }
+                s = u.requiredVramBytes > u.availableVramBytes
+                    ? t("No hay configuración segura: hace falta \(need(u.requiredVramBytes)) de VRAM y hay \(need(u.availableVramBytes)).",
+                        "No safe configuration: it needs \(need(u.requiredVramBytes)) of VRAM and \(need(u.availableVramBytes)) is free.")
+                    : t("No hay configuración segura: hace falta \(need(u.requiredHostBytes)) de RAM y ahora hay \(need(u.availableHostBytes)).",
+                        "No safe configuration: it needs \(need(u.requiredHostBytes)) of RAM and \(need(u.availableHostBytes)) is available now.")
+            } else {
+                s = t("Ninguna configuración deja un margen de VRAM seguro con este contexto; reduce el contexto.",
+                      "No configuration leaves a safe VRAM margin at this context; lower the context.")
+            }
         }
         if plan.kv == "q8_0" {
             s += " " + t("KV Q8: reduce la memoria del contexto lo suficiente para mantener una caché de expertos útil.",
