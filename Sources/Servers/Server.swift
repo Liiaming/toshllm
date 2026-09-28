@@ -148,6 +148,8 @@ struct ServerSettings {
     var plannedMode: String? = nil
     /// The retry after Dynamic MoE could not lock its expert bank plans without it.
     var planWithoutDMoE: Bool = false
+    /// The plan a llama-bench run follows under Dynamic MoE; llama-bench does not plan itself.
+    var benchmarkPlan: AutoMemoryPlan? = nil
 
     /// One model served across several GPUs, either by the all/N toggle or by an
     /// explicit selection of at least two cards.
@@ -519,6 +521,7 @@ struct ServerSettings {
     /// Arguments for `llama-bench`: separate from the server's because server-only
     /// flags are invalid here, but every option affecting speed must carry over.
     var benchmarkArguments: [String] {
+        if usesAutoPlan, let plan = benchmarkPlan { return dynamicMoeBenchmarkArguments(plan) }
         // Same load mode as the server, or the numbers are not the ones the app
         // delivers: with experts on the CPU, locking the model is worth most of
         // the prompt speed.
@@ -541,6 +544,59 @@ struct ServerSettings {
             args += ["--tensor-split", counts.map(String.init).joined(separator: ",")]
         }
         return args
+    }
+
+    /// Context sizes to offer for a model: powers of two up to what it was trained for (1M when the
+    /// file does not say), plus that exact size when it is not a power of two.
+    static func contextChoices(modelPath: String, from lowest: Int = 4096) -> [Int] {
+        let trained = GGUFMetadataCache.metadata(at: modelPath)?.trainedContext
+        var choices = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
+            .filter { $0 >= lowest && $0 <= (trained ?? 1048576) }
+        if let trained, trained > (choices.last ?? 0) { choices.append(trained) }
+        return choices.isEmpty ? [lowest] : choices
+    }
+
+    static func contextLabel(_ tokens: Int) -> String {
+        tokens >= 1048576 && tokens % 1048576 == 0 ? "\(tokens / 1048576)M" : "\(tokens / 1024)k"
+    }
+
+    /// The layout the engine's plan applies in llama-server, spelled out for llama-bench.
+    private func dynamicMoeBenchmarkArguments(_ plan: AutoMemoryPlan) -> [String] {
+        var args = ["-m", modelPath, "-ngl", "99", "-r", "2", "-fa", "1",
+                    "-p", String(benchPPClamped), "-n", String(benchTGClamped),
+                    "-ub", String(plan.ubatch), "-b", String(max(plan.ubatch, 2048))]
+        if benchDepthClamped > 0 { args += ["-d", String(benchDepthClamped)] }
+        switch plan.mode {
+        case "dmoe": args += ["-ot", Self.expertsOnHostOverride, "--load-mode", "mlock"]
+        case "dmoe_bounded": args += ["-ot", Self.expertsOnHostOverride, "--load-mode", "none"]
+        case "legacy_offload": args += ["-ncmoe", String(plan.ncmoe), "--load-mode", "none"]
+        default: break
+        }
+        if plan.kv != "f16" { args += ["-ctk", plan.kv, "-ctv", plan.kv] }
+        return args
+    }
+
+    static let expertsOnHostOverride = #"\.ffn_(up|down|gate|gate_up)_exps\.weight=CPU"#
+
+    /// Environment for llama-bench: under Dynamic MoE, what the plan sets in the engine.
+    var benchmarkEnvironment: [String: String] {
+        var env = environment
+        guard usesAutoPlan, let plan = benchmarkPlan else { return env }
+        env["GGML_SCHED_PREFETCH_EXPERTS"] = "1"
+        env["GGML_CPU_NO_REPACK"] = "1"
+        guard plan.usesDynamicMoE else { return env }
+        env["TOSH_DMOE_CACHE_MIB"] = "auto"
+        env["TOSH_DMOE_RESERVE_MIB"] = String(Int(plan.reserveMib))
+        env["TOSH_DMOE_MIN_ARENA_MIB"] = String(Int(plan.minArenaMib))
+        env["TOSH_DMOE_RARE_ROWS"] = "auto"
+        env["TOSH_DMOE_RARE_TAIL"] = "0"
+        if plan.mode == "dmoe_bounded", let warm = plan.product?.dmoe.warmBytes, warm > 0 {
+            env["TOSH_DMOE_HOST_CACHE_MIB"] = String(warm / 1_048_576)
+            // batches of up to 8 tokens stay in mixed execution; the bank has no bytes for the CPU backend
+            env["GGML_OP_OFFLOAD_MIN_BATCH"] = "9"
+            env["TOSH_DMOE_HOST_WARMUP_FILL_MIB"] = "max"
+        }
+        return env
     }
 
     /// Workload sizes kept within what llama-bench accepts and a Mac can finish.

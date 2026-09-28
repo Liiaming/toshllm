@@ -26,6 +26,13 @@ struct GGUFMetadata: Sendable {
         return Self.fileTypeLabels[value]
     }
 
+    /// Context the model was trained for (`<arch>.context_length`); nil when the file does not say.
+    var trainedContext: Int? {
+        guard let arch = string(for: "general.architecture"),
+              let n = uint32(forSuffix: "\(arch).context_length"), n > 0 else { return nil }
+        return Int(n)
+    }
+
     var isMoE: Bool {
         if let experts = uint32(forSuffix: "expert_count") { return experts > 0 }
         guard let architecture = string(for: "general.architecture") else { return false }

@@ -287,8 +287,8 @@ struct DashboardView: View {
                     Text(loc.t("Contexto", "Context")).font(.callout)
                     Spacer(minLength: 8)
                     Picker("", selection: $ctx) {
-                        ForEach([4096, 8192, 16384, 32768, 65536, 131072, 262144], id: \.self) { n in
-                            Text("\(n / 1024)k").tag(n)
+                        ForEach(ServerSettings.contextChoices(modelPath: modelPath), id: \.self) { n in
+                            Text(ServerSettings.contextLabel(n)).tag(n)
                         }
                     }
                     .labelsHidden().fixedSize().disabled(serverBusy)
@@ -881,8 +881,8 @@ struct AddedServerCard: View {
                 Picker("", selection: Binding(
                     get: { isPinned(Profile.Pin.ctx) ? (c.profile?.ctx ?? gCtx) : gCtx },
                     set: { c.profile?.ctx = $0; pin(Profile.Pin.ctx); manager.schedulePersist() })) {
-                    ForEach([4096, 8192, 16384, 32768, 65536, 131072, 262144], id: \.self) { n in
-                        Text("\(n / 1024)k").tag(n)
+                    ForEach(ServerSettings.contextChoices(modelPath: c.effectiveSettings().modelPath), id: \.self) { n in
+                        Text(ServerSettings.contextLabel(n)).tag(n)
                     }
                 }
                 .labelsHidden().fixedSize().disabled(busy)

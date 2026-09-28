@@ -13,6 +13,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Improved
 
+- **LLMs: the context menus offer 128k, 256k, 512k and 1M when the model supports them.** The choices stop at the context each model was trained for, which the model details and the server page now show.
+
 - **Images: Qwen-Image 2.1 edits with reference images take about a quarter of the time.** The text and reference part of the prompt is computed once per image instead of at every step: on a Radeon RX 6700 XT at 1024x1024 a step with one reference goes from 28.5 to 7.9 seconds, and with two from 43.9 to 9.1, so a 25-step edit with two references takes under 5 minutes instead of about 19. On cards with 8 GB the reference edit falls back to the previous speed when this does not fit.
 
 - **Images: Qwen-Image 2.1 generates from text about 40% faster.** On a Radeon RX 6700 XT at 1024x1024 a 25-step image takes 182 seconds instead of 314: each step goes from 11.6 to 6.6 seconds, and cards with 12 GB or more decode the result in larger tiles, 12.2 seconds instead of 19.9.

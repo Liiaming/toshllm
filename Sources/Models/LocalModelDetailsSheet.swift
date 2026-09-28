@@ -65,6 +65,10 @@ struct LocalModelDetailsSheet: View {
                 detailRow(loc.t("Parámetros", "Parameters"), String(format: "%.1fB", parameters))
             }
             detailRow(loc.t("Tipo", "Type"), model.isMoE ? "MoE" : loc.t("Denso", "Dense"))
+            if let trained = metadata?.trainedContext {
+                detailRow(loc.t("Contexto máximo", "Maximum context"),
+                          "\(ServerSettings.contextLabel(trained)) · \(trained.formatted()) tokens")
+            }
         }
     }
 

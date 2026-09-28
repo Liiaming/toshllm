@@ -77,6 +77,7 @@ struct AutoMemoryPlan: Decodable, Equatable {
     let ncmoe: Int
     let reserveMib: Double
     let arenaMib: Double
+    let minArenaMib: Double
     let projectedFreeMib: Double
     let hostRequiredMib: Double
     let vramTotalMib: Double

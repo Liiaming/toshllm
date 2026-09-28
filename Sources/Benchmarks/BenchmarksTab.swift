@@ -246,7 +246,9 @@ struct BenchmarksView: View {
                     if cfg.benchDepthClamped > 0 {
                         chip("d\(cfg.benchDepthClamped)", active: true)
                     }
-                    if isMoEModel {
+                    if cfg.usesAutoPlan {
+                        chip("Dynamic MoE", active: true)
+                    } else if isMoEModel {
                         chip("ncmoe \(cfg.ncmoe)", active: cfg.ncmoe > 0)
                     }
                     chip("K:\(cfg.cacheTypeK)", active: cfg.cacheTypeK != "f16")
@@ -362,12 +364,21 @@ struct BenchmarksView: View {
         Divider().padding(.horizontal, 14).frame(height: 70)
     }
 
+    /// Under Dynamic MoE the engine's plan owns offload, batch and KV; the run follows it.
+    private var dynamicMoeNote: some View {
+        Text(loc.t("Activado: el plan del motor decide expertos, lote y KV", "On: the engine's plan picks experts, batch and KV"))
+            .font(.caption).foregroundStyle(.secondary)
+            .help(loc.t("Se desactiva en Ajustes → Rendimiento y memoria.", "Turn it off in Settings → Performance & Memory."))
+    }
+
     private var advancedBenchmarkControls: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 compactWorkloadFields.frame(maxWidth: 360)
                 Divider().frame(height: 54)
-                if isMoEModel {
+                if cfg.usesAutoPlan {
+                    field("Dynamic MoE") { dynamicMoeNote }
+                } else if isMoEModel {
                     field(loc.t("MoE en CPU", "MoE on CPU")) {
                         Stepper("\(cfg.ncmoe)", value: $cfg.ncmoe, in: 0...99)
                     }
@@ -389,7 +400,7 @@ struct BenchmarksView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if isMoEModel {
+                if isMoEModel && !cfg.usesAutoPlan {
                     Button { rememberWorkload(); bench.sweep(settings: cfg) } label: {
                         Label(loc.t("Encontrar equilibrio", "Find balance"), systemImage: "scope")
                     }
@@ -469,7 +480,9 @@ struct BenchmarksView: View {
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
-                            if isMoEModel {
+                            if cfg.usesAutoPlan {
+                                field("Dynamic MoE") { dynamicMoeNote }
+                            } else if isMoEModel {
                                 field(loc.t("MoE en CPU", "MoE on CPU")) {
                                     Stepper("\(cfg.ncmoe)", value: $cfg.ncmoe, in: 0...99).fixedSize()
                                 }
@@ -547,7 +560,7 @@ struct BenchmarksView: View {
                                       disabled: cfg.modelPath.isEmpty || server.state == .running || server.state == .starting) {
                                 rememberWorkload(); bench.runReal(settings: cfg)
                             }
-                            if isMoEModel {
+                            if isMoEModel && !cfg.usesAutoPlan {
                                 runChoice(loc.t("Encontrar equilibrio", "Find best balance"),
                                           subtitle: loc.t("Busca la distribución GPU/CPU más segura.",
                                                           "Finds a safe GPU/CPU distribution."),

@@ -822,8 +822,8 @@ struct SettingsView: View {
             if settingsDestination == .inference {
             Section {
                 LabeledContent(loc.t("Contexto", "Context")) {
-                    ToshDropdown(selection: $ctx, options: [4096, 8192, 16384, 32768, 65536, 131072, 262144].map {
-                        .init(value: $0, title: "\($0 / 1024)k tokens")
+                    ToshDropdown(selection: $ctx, options: ServerSettings.contextChoices(modelPath: modelPath).map {
+                        .init(value: $0, title: "\(ServerSettings.contextLabel($0)) tokens")
                     })
                 }
                 .settingsGlyph("text.alignleft")

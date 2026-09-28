@@ -1012,6 +1012,35 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertNil(plan.product)
     }
 
+    func testDynamicMoeBenchmarkFollowsThePlan() throws {
+        let model = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tosh-bench-plan-\(UUID().uuidString).gguf")
+        try writeMinimalMoEGGUF(model)
+        defer { try? FileManager.default.removeItem(at: model) }
+        var s = makeSettings()
+        s.modelPath = model.path
+        s.dynamicMoeEnabled = true
+        let json = #"{"plan_schema_version": 1, "product": {"mode": "PLAN_BOUNDED_DMOE", "mode_label_key": "plan.mode.bounded_dmoe", "reason": "CURRENT_RAM_LIMIT", "warnings": [], "limits": [], "limiting_resource": "HOST_RAM", "memory": {"physical_bytes": 1, "reclaimable_bytes": 1, "projected_rss_bytes": 1, "projected_vram_bytes": 1}, "dmoe": {"expert_bank_bytes": 1, "hot_bytes": 1, "warm_bytes": 15032385536, "coverage": 1.3, "coverage_state": "GOOD"}, "runtime": {"context": 8192, "kv_type": "q8_0", "kv_bytes": 1, "ubatch": 1024, "ncmoe_layers": 0}}, "state": "DMOE_BOUNDED_HOST", "mode": "dmoe_bounded", "reason": "r", "fallback": "", "kv": "q8_0", "n_ctx": 8192, "ubatch": 1024, "ncmoe": 0, "reserve_mib": 975, "arena_mib": 7000, "min_arena_mib": 546, "projected_private_mib": 1, "projected_free_mib": 975, "vram_total_mib": 12266, "vram_free_mib": 11960, "host_required_mib": 1, "host_ram_mib": 32768, "host_available_mib": 1, "host_reserve_mib": 1, "bank_mib": 17000, "mlock": "required", "dispersion": "normal", "candidates": []}"#
+        s.benchmarkPlan = try XCTUnwrap(AutoMemoryPlan.decode(Data(json.utf8)))
+        let args = s.benchmarkArguments
+        XCTAssertEqual(args[args.firstIndex(of: "-ub")! + 1], "1024")
+        XCTAssertEqual(args[args.firstIndex(of: "--load-mode")! + 1], "none")
+        XCTAssertEqual(args[args.firstIndex(of: "-ctk")! + 1], "q8_0")
+        XCTAssertTrue(args.contains(ServerSettings.expertsOnHostOverride))
+        XCTAssertFalse(args.contains("-ncmoe"))
+        let env = s.benchmarkEnvironment
+        XCTAssertEqual(env["TOSH_DMOE_CACHE_MIB"], "auto")
+        XCTAssertEqual(env["TOSH_DMOE_RESERVE_MIB"], "975")
+        XCTAssertEqual(env["TOSH_DMOE_HOST_CACHE_MIB"], "14336")
+        XCTAssertEqual(env["GGML_OP_OFFLOAD_MIN_BATCH"], "9")
+    }
+
+    func testContextChoicesFollowTheModel() {
+        XCTAssertEqual(ServerSettings.contextChoices(modelPath: "/nonexistent.gguf").last, 1048576)
+        XCTAssertEqual(ServerSettings.contextLabel(262144), "256k")
+        XCTAssertEqual(ServerSettings.contextLabel(1048576), "1M")
+    }
+
     func testAutoMemoryPlanDecodesTheProductSchema() throws {
         func plan(_ mode: String, _ legacy: String, _ state: String, _ coverage: String, _ extra: String = "") throws -> AutoMemoryPlan {
             let json = #"{"plan_schema_version": 1, "product": {"mode": "\#(mode)", "mode_label_key": "plan.mode.x", "reason": "CURRENT_RAM_LIMIT", "warnings": ["COVERAGE_CONSTRAINED"], "limits": [], "limiting_resource": "HOST_RAM", "fallback": {"selected": true, "type": "PLAN_BOUNDED_DMOE"}, "memory": {"physical_bytes": 34359738368, "reclaimable_bytes": 20000000000, "projected_rss_bytes": 15000000000, "projected_vram_bytes": 10000000000}, "dmoe": {"expert_bank_bytes": 18000000000, "hot_bytes": 7000000000, "warm_bytes": 14000000000, "coverage": 1.12, "coverage_state": "\#(coverage)"}, "runtime": {"context": 8192, "kv_type": "f16", "kv_bytes": 400000000, "ubatch": 1024, "ncmoe_layers": 0}\#(extra)}, "state": "\#(state)", "mode": "\#(legacy)", "reason": "r", "fallback": "", "kv": "f16", "n_ctx": 8192, "ubatch": 1024, "ncmoe": 0, "reserve_mib": 975, "arena_mib": 7000, "min_arena_mib": 546, "projected_private_mib": 10000, "projected_free_mib": 975, "vram_total_mib": 12266, "vram_free_mib": 11960, "host_required_mib": 15000, "host_ram_mib": 32768, "host_available_mib": 26000, "host_reserve_mib": 8192, "bank_mib": 17000, "mlock": "required", "dispersion": "high", "candidates": []}"#

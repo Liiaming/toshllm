@@ -82,7 +82,7 @@ struct ServerDetailView: View {
                             detail: estimate.map { String(format: "%.1f GB RAM", $0.ramGB) }
                                 ?? loc.t("Selecciona un modelo", "Choose a model"), tint: .chartSecondary)
             DashboardMetric(title: loc.t("Longitud de contexto", "Context length"), icon: "doc.plaintext",
-                            value: settings.contextAutomatic ? loc.t("Auto · 16k", "Auto · 16k") : "\(settings.ctx / 1024)k",
+                            value: settings.contextAutomatic ? loc.t("Auto · 16k", "Auto · 16k") : ServerSettings.contextLabel(settings.ctx),
                             detail: settings.contextAutomatic
                                 ? loc.t("Seleccionado por la app", "Selected by the app")
                                 : loc.t("Máximo configurado", "Configured maximum"),
@@ -413,7 +413,7 @@ private struct ServerConfigurationWorkspace: View {
                 }
             }
             ServerSettingRow(icon: "doc.plaintext", title: loc.t("Longitud de contexto", "Context length")) {
-                ToshDropdown(selection: contextChoice(settings), options: contextOptions, width: 180)
+                ToshDropdown(selection: contextChoice(settings), options: contextOptions(settings), width: 180)
             }
             ServerSettingRow(icon: "wifi", title: loc.t("Descubrible en red local", "Discoverable on local network")) {
                 Toggle(loc.t("Descubrible en red local", "Discoverable on local network"),
@@ -495,13 +495,19 @@ private struct ServerConfigurationWorkspace: View {
                             TagBadge(text: ModelName.forPath(settings.modelPath).quant.isEmpty ? "GGUF" : ModelName.forPath(settings.modelPath).quant,
                                      icon: "shippingbox", color: .secondary)
                             if ServerSettings.modelIsMoE(at: settings.modelPath) { TagBadge(text: "MoE", icon: "square.stack.3d.up", color: .purple) }
+                            if settings.usesAutoPlan { TagBadge(text: "Dynamic MoE", icon: "wand.and.stars", color: .orange) }
+                            if let trained = GGUFMetadataCache.metadata(at: settings.modelPath)?.trainedContext {
+                                TagBadge(text: loc.t("Contexto %@", "Context %@", ServerSettings.contextLabel(trained)), icon: "doc.plaintext", color: .secondary)
+                            }
                             if ServerSettings.mightSupportVision(modelPath: settings.modelPath) { TagBadge(text: "Vision", icon: "eye", color: .purple) }
                             if showAdvanced && ServerSettings.modelUsesMTP(at: settings.modelPath) { TagBadge(text: "MTP", icon: "hare.fill", color: .green) }
                             if showAdvanced && ServerSettings.dflashDraftPath(forModel: settings.modelPath) != nil { TagBadge(text: "DFlash", icon: "bolt.fill", color: .orange) }
                         }
                     }
                     Spacer(minLength: 8)
-                    Label(settings.ncmoe > 0 && ServerSettings.modelIsMoE(at: settings.modelPath)
+                    Label(settings.usesAutoPlan
+                          ? (server.autoPlan.map { AutoMemoryText.modeLabel($0.mode) } ?? loc.t("Plan del motor", "Engine plan"))
+                          : settings.ncmoe > 0 && ServerSettings.modelIsMoE(at: settings.modelPath)
                           ? loc.t("Limitado por RAM", "RAM limited")
                           : loc.t("Limitado por VRAM", "VRAM limited"),
                           systemImage: "gauge.with.needle")
@@ -517,13 +523,21 @@ private struct ServerConfigurationWorkspace: View {
 
     private func modelRuntimeGroup(_ settings: ServerSettings) -> some View {
         ModelConfigurationGroup(title: loc.t("Ejecución", "Runtime"), icon: "memorychip") {
-            if showAdvanced {
+            if settings.usesAutoPlan {
+                ServerSettingRow(icon: "wand.and.stars", title: "Dynamic MoE",
+                                 detail: server.autoPlan.map { AutoMemoryText.summary($0, runtime: server.autoRuntime) }
+                                    ?? loc.t("Activado: el motor decide expertos, lote y KV al arrancar",
+                                             "On: the engine picks experts, batch and KV when it starts")) {
+                    Text(loc.t("Activado", "On")).font(.callout.weight(.medium)).foregroundStyle(.orange)
+                        .help(loc.t("Se cambia en Ajustes → Rendimiento y memoria.", "Change it in Settings → Performance & Memory."))
+                }
+            } else if showAdvanced {
                 ServerSettingRow(icon: "square.stack.3d.down.right", title: loc.t("Micro-lote", "Micro-batch"),
                                  detail: loc.t("Equilibra velocidad y memoria", "Balances throughput and memory")) {
                     ToshDropdown(selection: ubatch(settings), options: ubatchOptions, width: 184, listWidth: 250)
                 }
             }
-            if ServerSettings.modelIsMoE(at: settings.modelPath) {
+            if ServerSettings.modelIsMoE(at: settings.modelPath) && !settings.usesAutoPlan {
                 if showAdvanced { Divider() }
                 ServerSettingRow(icon: "cpu", title: loc.t("Expertos MoE en CPU", "MoE experts on CPU"),
                                  detail: loc.t("Reduce VRAM usando memoria del sistema", "Trades system memory for lower VRAM use")) {
@@ -609,12 +623,20 @@ private struct ServerConfigurationWorkspace: View {
         profileStore.profiles.map { .init(value: $0.id.uuidString, title: $0.name, systemImage: "person.crop.circle") }
     }
 
-    private var contextOptions: [ToshDropdown<String>.Option] {
-        [.init(value: "automatic", title: loc.t("Automático", "Automatic"),
-               subtitle: loc.t("Recomendado · 16k", "Recommended · 16k"), systemImage: "wand.and.stars")] +
-        [8192, 16384, 32768, 65536].map {
-            .init(value: String($0), title: "\($0 / 1024)k", systemImage: "doc.plaintext")
+    private func contextOptions(_ settings: ServerSettings) -> [ToshDropdown<String>.Option] {
+        let choices = ServerSettings.contextChoices(modelPath: settings.modelPath, from: 8192)
+        let trained = GGUFMetadataCache.metadata(at: settings.modelPath)?.trainedContext
+        var options: [ToshDropdown<String>.Option] = [.init(value: "automatic", title: loc.t("Automático", "Automatic"),
+               subtitle: loc.t("Recomendado · 16k", "Recommended · 16k"), systemImage: "wand.and.stars")]
+        options += choices.map {
+            .init(value: String($0), title: ServerSettings.contextLabel($0),
+                  subtitle: $0 == trained ? loc.t("Máximo del modelo", "Model maximum") : nil, systemImage: "doc.plaintext")
         }
+        // a size saved before, or set elsewhere, stays selectable
+        if !settings.contextAutomatic && !choices.contains(settings.ctx) {
+            options.append(.init(value: String(settings.ctx), title: ServerSettings.contextLabel(settings.ctx), systemImage: "doc.plaintext"))
+        }
+        return options
     }
 
     private var flashAttentionOptions: [ToshDropdown<String>.Option] {

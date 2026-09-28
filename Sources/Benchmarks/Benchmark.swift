@@ -11,6 +11,8 @@ struct BenchResult: Codable, Identifiable {
     let ncmoe: Int
     /// Cache slots per layer when the run used Dynamic MoE; nil on every other run.
     var dmoeK: Int?
+    /// The Dynamic MoE plan the run followed (full_gpu, dmoe, dmoe_bounded, legacy_offload); nil when off.
+    var dynamicMoe: String?
     let pp: Double
     let tg: Double
     // optional for backward compatibility with older saved results
@@ -56,7 +58,10 @@ struct BenchResult: Codable, Identifiable {
         if let ppN, let tgN, ppN != 512 || tgN != 128 { parts.append("pp\(ppN)/tg\(tgN)") }
         if let depth, depth > 0 { parts.append("d\(depth)") }
         if let accept { parts.append("MTP \(Int((accept * 100).rounded()))%") }
-        if let dmoeK, dmoeK > 0 {
+        if let dynamicMoe {
+            parts.append(dynamicMoe == "dmoe_bounded" ? "Dynamic MoE · RAM" : dynamicMoe == "legacy_offload"
+                         ? "Dynamic MoE · ncmoe \(ncmoe)" : "Dynamic MoE")
+        } else if let dmoeK, dmoeK > 0 {
             parts.append("dMoE K\(dmoeK)")
         } else if ncmoe > 0 {
             parts.append("ncmoe \(ncmoe)")
@@ -161,7 +166,7 @@ final class BenchmarkController: ObservableObject {
         === ToshLLM benchmark · \(Date().formatted(.iso8601)) ===
         model:  \(model)
         GPU:    \(settings.gpuLabel)
-        engine: \(settings.engineTag)\(settings.ncmoe > 0 ? " · ncmoe \(settings.ncmoe)" : "") · K:\(settings.cacheTypeK) V:\(settings.cacheTypeV)
+        engine: \(settings.engineTag)\(engineMemoryLabel(settings)) · K:\(settings.benchmarkPlan?.kv ?? settings.cacheTypeK) V:\(settings.benchmarkPlan?.kv ?? settings.cacheTypeV)
         FA:     \(settings.benchmarkFlashAttentionLabel)
         args:   \(settings.benchmarkArguments.joined(separator: " "))
         =========================
@@ -169,8 +174,38 @@ final class BenchmarkController: ObservableObject {
         """
     }
 
+    private func engineMemoryLabel(_ settings: ServerSettings) -> String {
+        if settings.usesAutoPlan {
+            guard let plan = settings.benchmarkPlan else { return " · Dynamic MoE" }
+            return " · Dynamic MoE \(plan.product?.mode ?? plan.mode)" + (plan.mode == "legacy_offload" ? " ncmoe \(plan.ncmoe)" : "")
+        }
+        return settings.ncmoe > 0 ? " · ncmoe \(settings.ncmoe)" : ""
+    }
+
     func run(settings: ServerSettings) {
         guard !running else { return }
+        // llama-bench does not plan: under Dynamic MoE it runs the plan the engine would pick
+        if settings.usesAutoPlan && settings.benchmarkPlan == nil {
+            running = true
+            replaceOutput("Dynamic MoE: planning memory…\n")
+            Task { [weak self] in
+                let plan = await AutoMemoryPlan.preview(settings: settings)
+                guard let self else { return }
+                self.running = false
+                guard let plan else {
+                    self.replaceOutput("Dynamic MoE: the engine could not plan memory for this model.\n")
+                    return
+                }
+                guard !plan.isUnsupported else {
+                    self.replaceOutput("Dynamic MoE: \(AutoMemoryText.reason(plan))\n")
+                    return
+                }
+                var planned = settings
+                planned.benchmarkPlan = plan
+                self.run(settings: planned)
+            }
+            return
+        }
         let benchPath = URL(fileURLWithPath: settings.serverBinary)
             .deletingLastPathComponent().appendingPathComponent("llama-bench").path
         guard FileManager.default.fileExists(atPath: benchPath) else {
@@ -192,7 +227,7 @@ final class BenchmarkController: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: benchPath)
         p.arguments = settings.benchmarkArguments
-        p.environment = settings.environment
+        p.environment = settings.benchmarkEnvironment
 
         let pipe = Pipe()
         p.standardOutput = pipe
@@ -299,9 +334,10 @@ final class BenchmarkController: ObservableObject {
             let accept = reps.compactMap(\.accept).last
             let name = URL(fileURLWithPath: s.modelPath).lastPathComponent
             let engine = s.serverBinary == ServerSettings.defaultBinary ? "bundled" : "externo"
-            history.insert(BenchResult(date: .now, model: name, ncmoe: s.ncmoe,
-                                       dmoeK: nil, pp: pp, tg: tg,
-                                       ctk: s.cacheTypeK, ctv: s.cacheTypeV, engine: engine,
+            let realPlan = s.usesAutoPlan ? AutoMemoryPlan.readPlan(port: s.port) : nil
+            history.insert(BenchResult(date: .now, model: name, ncmoe: realPlan?.ncmoe ?? s.ncmoe,
+                                       dmoeK: nil, dynamicMoe: s.usesAutoPlan ? (realPlan?.mode ?? "dmoe") : nil, pp: pp, tg: tg,
+                                       ctk: realPlan?.kv ?? s.cacheTypeK, ctv: realPlan?.kv ?? s.cacheTypeV, engine: engine,
                                        fa: s.benchmarkFlashAttentionRoute,
                                        gpu: s.gpuLabel, peer: s.mgpuPeer && s.isSplitting, profile: base.makeProfile(name: name),
                                        ppN: nil, tgN: s.benchTGClamped,
@@ -381,9 +417,10 @@ final class BenchmarkController: ObservableObject {
         if let pp = speed(ppTest), let tg = speed(tgTest) {
             let name = URL(fileURLWithPath: settings.modelPath).lastPathComponent
             let engine = settings.serverBinary == ServerSettings.defaultBinary ? "bundled" : "externo"
-            history.insert(BenchResult(date: .now, model: name, ncmoe: settings.ncmoe,
-                                       dmoeK: nil, pp: pp, tg: tg,
-                                       ctk: settings.cacheTypeK, ctv: settings.cacheTypeV, engine: engine,
+            let plan = settings.benchmarkPlan
+            history.insert(BenchResult(date: .now, model: name, ncmoe: plan?.ncmoe ?? settings.ncmoe,
+                                       dmoeK: nil, dynamicMoe: plan?.mode, pp: pp, tg: tg,
+                                       ctk: plan?.kv ?? settings.cacheTypeK, ctv: plan?.kv ?? settings.cacheTypeV, engine: engine,
                                        fa: settings.benchmarkFlashAttentionRoute,
                                        gpu: settings.gpuLabel, peer: settings.mgpuPeer && settings.isSplitting, profile: settings.makeProfile(name: name),
                                        ppN: settings.benchPPClamped, tgN: settings.benchTGClamped,
@@ -411,7 +448,7 @@ final class BenchmarkController: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: benchPath)
         p.arguments = settings.benchmarkArguments + extraArgs
-        var environment = settings.environment
+        var environment = settings.benchmarkEnvironment
         for (key, value) in environmentOverrides {
             if let value { environment[key] = value } else { environment.removeValue(forKey: key) }
         }
