@@ -1318,6 +1318,15 @@ final class ServerSettingsTests: XCTestCase {
                        "MTP must be silently skipped when the GGUF lacks the head")
     }
 
+    func testMTPStaysOnUnderDynamicMoe() {
+        var s = makeSettings()
+        s.dynamicMoeEnabled = true
+        s.executionMode = "auto"
+        s.modelPath = makeGGUF(nextnLayers: 1, tensorName: "blk.0.nextn.eh_proj.weight").path
+        s.plannedMode = "dmoe_bounded"
+        XCTAssertTrue(s.arguments.contains("draft-mtp"))
+    }
+
     func testMTPAppliesAutomaticallyWithExpertOffload() {
         var s = makeSettings()
         s.ncmoe = 12

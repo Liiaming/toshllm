@@ -341,24 +341,21 @@ struct ServerSettings {
         if reasoningInline { args += ["--reasoning-format", "none"] }
         if apiKeyEnabled { args += ["--api-key", Keychain.apiKey()] }
         // A compatible downloaded DFlash draft takes precedence over embedded MTP.
-        // Speculation decodes several tokens at once and the expert cache only has slots
-        // for one token's experts, so the two cannot run together.
-        // a draft is only planned for next to a full model on the GPU
-        let speculationAllowed = !usesAutoPlan || plannedMode == "full_gpu"
-        if speculationAllowed {
-            if let selection = dflashSelection(modelPath: modelPath, ncmoe: ncmoe) {
-                // Quantize the draft's KV cache: it doubles KV pressure at high ctx, and
-                // q8_0 halves that footprint at no measurable quality cost for a draft.
-                args += ["-md", selection.draft, "--spec-type", "draft-dflash",
-                         "-ngld", String(selection.ngld),
-                         "-ctkd", "q8_0", "-ctvd", "q8_0"]
-            } else if Self.mtpEnabled(forModel: modelPath), let draft = Self.mtpDraftPath(forModel: modelPath) {
-                args += ["-md", draft, "--spec-type", "draft-mtp"]
-                args += Self.mtpDraftWidthArgs(forModel: modelPath, gpuArchitecture: selectedGPUArchitecture)
-            } else if Self.mtpEnabled(forModel: modelPath), Self.modelHasMTP(at: modelPath) {
-                args += ["--spec-type", "draft-mtp"]
-                args += Self.mtpDraftWidthArgs(forModel: modelPath, gpuArchitecture: selectedGPUArchitecture)
-            }
+        // Dynamic MoE plans memory without a separate draft model, so DFlash only joins a
+        // full-GPU plan; the embedded MTP head is part of the model and the plan counts it.
+        let draftAllowed = !usesAutoPlan || plannedMode == "full_gpu"
+        if draftAllowed, let selection = dflashSelection(modelPath: modelPath, ncmoe: ncmoe) {
+            // Quantize the draft's KV cache: it doubles KV pressure at high ctx, and
+            // q8_0 halves that footprint at no measurable quality cost for a draft.
+            args += ["-md", selection.draft, "--spec-type", "draft-dflash",
+                     "-ngld", String(selection.ngld),
+                     "-ctkd", "q8_0", "-ctvd", "q8_0"]
+        } else if draftAllowed, Self.mtpEnabled(forModel: modelPath), let draft = Self.mtpDraftPath(forModel: modelPath) {
+            args += ["-md", draft, "--spec-type", "draft-mtp"]
+            args += Self.mtpDraftWidthArgs(forModel: modelPath, gpuArchitecture: selectedGPUArchitecture)
+        } else if Self.mtpEnabled(forModel: modelPath), Self.modelHasMTP(at: modelPath) {
+            args += ["--spec-type", "draft-mtp"]
+            args += Self.mtpDraftWidthArgs(forModel: modelPath, gpuArchitecture: selectedGPUArchitecture)
         }
         if let ui = Self.chatUIPath { args += ["--path", ui] }
         args += extraArgTokens.cli
