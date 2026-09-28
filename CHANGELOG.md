@@ -7,7 +7,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **LLMs: Dynamic MoE (experimental, off by default) keeps a MoE model's most used experts in VRAM and the rest in RAM, sized for the context you ask for and for the memory the Mac has free right now.** Turn it on in Settings; off, MoE models keep the standard expert offload. It keeps about 1 GiB of VRAM free, shows the plan before loading, and does not load a model that would not fit safely. On a Radeon RX 6700 XT Qwen3.6-35B-A3B generates 47 tokens a second at 8K and 32K instead of about 31 with experts on the CPU, and Gemma 4 26B-A4B 40 at 8K instead of 21.
+- **LLMs: Dynamic MoE, an experimental mode for Mixture-of-Experts models that do not fit in VRAM, off by default.** Turn it on in Settings → Performance & Memory; off, MoE models keep the standard expert offload as before. The engine keeps the most used experts in VRAM and the rest in RAM, sized for the context you ask for and for the memory the Mac has free right now, and shows the plan before the model starts. On a Radeon RX 6700 XT with the whole expert bank in RAM, Qwen3.6-35B-A3B reads a 3,400-token prompt at 581 tokens a second instead of 311 and generates at 43.8 instead of 29.0; GPT-OSS 20B reads at 902 instead of 497 and generates at 68.1 instead of 40.7.
+
+- **LLMs: with little free RAM, Dynamic MoE keeps only part of the expert bank in memory and reads the rest from the model file.** It fills that memory while the model loads, so the first prompt is not cold. With 8 GB taken by other apps, Qwen3.6-35B-A3B runs in 13 GB of RAM instead of 22, reading a prompt at 366 tokens a second and generating at 31. Models split into several files, such as Qwen3.8 Flash Next, are planned and read as a whole.
 
 ### Improved
 
@@ -17,11 +19,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **LLMs: Dynamic MoE now works with models split into several files, such as Qwen3.8 Flash Next.** On one Radeon Pro Vega II die it picks Dynamic MoE by itself and reads a 3,000-token prompt at 202 tokens a second, against 179 with the manual settings, and generates at the same 21.
+- **LLMs: when no safe memory plan exists, Dynamic MoE does not load the model and says what it needed and what was free.** Before, the engine fell back to its default layout, could fill the GPU and stop answering, as Gemma 4 26B-A4B did on a Mac short of free memory.
 
-- **LLMs: with Dynamic MoE, long chats no longer push a Mixture-of-Experts model into swap.** The plan now leaves room for the conversation state the server keeps in memory: Gemma 4 26B-A4B on a 32 GB Mac wrote 2 GB to swap during a long chat and now writes none.
+- **LLMs: with Dynamic MoE, long chats no longer push the model into swap.** The plan now leaves room for the conversation state the server keeps in memory: Gemma 4 26B-A4B on a 32 GB Mac wrote 2 GB to swap during a long chat and now writes none.
 
-- **LLMs: when no memory plan fits, the engine refuses to load the model and says why.** Before, it could fall back to the default settings, fill the GPU and stop answering, as Gemma 4 26B-A4B did on a machine short of free memory.
+- **LLMs: FirePro and other GCN cards before Vega join Q4_0, Q5_0 and Q8_0 data correctly.** The 48 concatenation cases that failed on those cards in the engine's own tests now pass.
+
+### Known issues
+
+- **LLMs: with little free RAM, Dynamic MoE reads prompts slower.** Below a coverage of about 1.25 (shown in the plan) prompts can take twice as long as with the whole bank in RAM; generation drops less.
+
+- **LLMs: Dynamic MoE's prompt speed is limited by moving experts to the GPU.** Up to a third of the time goes to that copy; overlapping it with computation is future work.
 
 ## [0.87.10] - 2026-09-25
 
