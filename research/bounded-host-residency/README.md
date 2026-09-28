@@ -308,3 +308,55 @@ bounded plan it would replace.
 Also fixed here: a plan taken by Auto crashed llama-server on 9-31 token prompts (the offload
 threshold and the cache switch had been read by the planner's probes before the plan set them),
 and 0108 did not build without Dynamic MoE.
+
+## Product hardening: fail-closed Auto, split models, Gemma (patch 0110)
+
+**Gemma.** With TOSH_AUTO under a tight RAM budget (headroom forced to 19.5 GiB, 7.9 GiB allowed)
+every candidate was rejected: full GPU by VRAM, the bounded cache at coverage 0.83-0.96, and the
+classic expert offload (15-17 layers on the host need 8.2-9.1 GiB). The plan was UNSUPPORTED, but
+`common_init_result` ignored the result and loaded with the user's arguments. Upstream `fit` then
+put 15 layers of experts in a CPU_REPACK buffer over mmap, and the first long prompt wedged the GPU:
+the main thread waited in `commandBufferWithUnretainedReferences` with no command buffer ever
+completing. The same layout with `GGML_CPU_NO_REPACK=1` ran (262.5 t/s), and so did an explicit
+ncmoe with no repack (386.6 t/s): the expert maths were never the problem. 0110 refuses the load
+(exit 1 in 5 s, no VRAM touched) and, when the budget allows it, picks the classic offload
+explicitly (PLAN_CLASSIC_NCMOE, no repack, no mmap). Same budget, bounded against classic:
+262.5 / 47.42 t/s prefill / decode against 416.4 / 25.32.
+
+Gemma, first 3.4K prompt and 2048-token decode (`dmoe_bench`, ub 1024 / 512 for ncmoe):
+
+| mode | prefill | 12-turn prefill | chat decode | 2048 decode | p50/p95/p99 ms | RSS | KL vs full |
+|---|---:|---:|---:|---:|---|---:|---:|
+| full host DMoE | 633.2 | 397.2 | 44.85 | 54.34 | 18.3/20.5/24.4 | 14.5 GiB | ref |
+| bounded 8.9 GiB (cov 1.105) | 573.9 | 408.8 | 37.86 | 53.94 | 18.3/21.2/26.1 | 10.0 GiB | 0 / 5.3e-4 |
+| classic ncmoe 17 | 394.1 | 183.9 | 22.30 | 23.01 | 43.6/45.7/47.3 | 8.8 GiB | 2.4e-3 |
+
+The bounded run with the same CPU/GPU split as the full bank (5974 host experts in both) matched it
+bit for bit; the classic offload's KL is host arithmetic on 17 layers. The multi-turn bench now
+renders turns with the model's Jinja template (`common_chat_templates_apply`), as llama-server does.
+
+**Planner accounting.** The planner now sees every shard of a split GGUF, counts every weight the
+probe leaves in host memory (Flash Next keeps 27.5 GiB of per-layer token embeddings there, which the
+old estimate missed: projected host 73.4 GiB against a real RSS of 116 GiB, now 100.2), and rejects a
+RAM cache smaller than one layer per expert size (1028 MiB for Gemma, which has two sizes). Reasons
+carry codes: PLAN_FULL_GPU, PLAN_FULL_HOST_DMOE, PLAN_BOUNDED_DMOE, PLAN_CLASSIC_NCMOE,
+PLAN_UNSUPPORTED, with limits VRAM_LIMIT, STATIC_RAM_LIMIT, CURRENT_RAM_LIMIT, WIRE_LIMIT,
+COVERAGE_TOO_LOW, STRUCTURAL_WARM_TOO_SMALL, SPLIT_GGUF_METADATA_ERROR, NO_SAFE_FALLBACK. Plans for
+Qwen, GPT-OSS, Gemma and GLM are identical to 0109 on 20 simulated machines (`plan_regression.py`).
+
+**Split models and the cold tier.** The RAM cache keeps one descriptor per shard and reads each
+expert from its own file. On a 64-lane card the loader fuses a file's gate and up experts into one
+tensor; the cache now reads both halves, and the fusion is skipped where it has no place (a mapped
+CPU buffer, "tensor buffer not set", or a repacking one, the repack.cpp:5153 assert, both on the
+default path with `fit`).
+
+Qwen3.8 Flash Next UD-Q4_K_XL, one Radeon Pro Vega II die, Auto without DMoE arguments:
+
+| | pp512 | tg128 | 3.4K prompt | 512 decode | RSS | HOT hit |
+|---|---:|---:|---:|---:|---:|---:|
+| Auto, full host (ub 1024, arena 20.2 GiB) | 301.2 | 23.12 | 202.4 | 21.22 | 116.6 GiB | 82.1% |
+| manual reference, same session | 308.7 | 23.00 | 179.4 | 21.22 | 116.3 GiB | 82.3% |
+| Auto, bounded 62.8 GiB (cov 1.18) | | | 127.1 | 20.54 | 65.5 GiB | 82.7% |
+
+Expert bytes read from three shards matched the loaded bank (576 checked, 0 differ), and 7866 slots
+promoted from the bounded cache verified against the file.
