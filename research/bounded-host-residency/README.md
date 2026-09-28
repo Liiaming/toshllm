@@ -419,3 +419,43 @@ CONTEXT_FAILED) with projected and measured RSS, footprint and VRAM.
 
 Flash Next, one Vega II die, final 0111: pp512 302.7 t/s, tg128 23.10, 3.4K prompt 201.7, decode
 21.19, footprint 72.9 GiB, VRAM 26.6 GiB against 30.0 projected, no swap.
+
+## Generic MoE prefill with Dynamic MoE (after 0112, no engine patch kept)
+
+Full host bank, same session, RX 6700 XT, `prefill/ubatch_sweep.sh` (llama-bench, t/s):
+
+| model | ubatch | pp512 | pp1024 | pp2048 | pp4096 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.6-35B-A3B | 512 / 1024 / 2048 / 4096 / 8192 | 889 / 889 / 889 / 900 / 884 | 899 / 1045 / 1040 / 1050 / 1050 | 875 / 1011 / 1058 / 1054 / 1049 | 845 / 989 / 1045 / 854 / 858 |
+| GPT-OSS 20B | same | 1216 / 1188 / 1200 / 1205 / 1214 | 1215 / 1368 / 1375 / 1379 / 1372 | 1175 / 1353 / 1346 / 1342 / 1340 | 1131 / 1291 / 1278 / 1164 / 1157 |
+| Gemma 4 26B-A4B | same | 827 / 868 / 847 / 842 / 781 | 813 / 937 / 956 / 958 / 924 | 811 / 920 / 958 / 958 / 951 | 785 / 896 / 915 / 736 / 729 |
+| GLM-4.7-Flash-REAP | same | 792 / 806 / 813 / 809 / 776 | 741 / 789 / 783 / 786 / 797 | 603 / 648 / 603 / 600 / 602 | 440 / 465 / 447 / 374 / 375 |
+
+2048 against Auto's 1024 at pp4096: Qwen 989.4 -> 1045.1 (5.6% faster), Gemma 896.3 -> 914.8 (2.1%),
+GPT-OSS 1290.8 -> 1278.2 (1.0% slower), GLM 465.2 -> 447.3 (3.8% slower). 4096 and up lose 10-20% on
+all four: compute memory doubles with each doubling of the batch (Qwen 440 / 735 / 1326 MiB at
+512 / 1024 / 2048, GPT-OSS 1.2 / 2.3 / 5.5 GiB, where attention without flash attention dominates)
+and comes out of the expert arena, so more experts come from the host (Qwen 43.9 -> 68.4 GiB
+uploaded from 2048 to 4096). Auto's 1024 is its rule: a larger batch only when it costs under 10% of
+the bank in arena, 2048 only for high expert dispersion. ggml's allocator already reuses memory by
+lifetime inside the graph, so the peak is one operation's live set, not attention plus MoE.
+
+Where the prefill time goes (`prefill/prefill_timelines.sh`, ubatch 1024, 3.4K prompt): the main
+thread waits for the router's ids while the GPU computes 56-70% of the prefill, and copies the
+routed host experts into the upload ring 24-35% (Qwen 2067 of 5847 ms, GPT-OSS 1145 of 3948, Gemma
+1738 of 5503, GLM 2141 of 8868). The copy already runs on every core (`dispatch_apply`), at about
+9.4 GB/s for Qwen's 19.4 GiB, and the GPU blits at about 6.4 GB/s: moving experts is the limit, not
+thread count.
+
+Blitting the routed experts straight from the wrapped host bank instead of the ring
+(`prefill/direct_blit_ab.sh`, two alternating rounds): Qwen 581.0 -> 444.9 t/s (23.4% slower),
+GPT-OSS 815.5 -> 553.9 (32.1% slower), Gemma 630.4 -> 477.5 (24.3% slower), GLM 369.6 -> 115-314:
+the GPU reading host pages is slower than a write-combined ring. Dropped.
+
+Next layer's experts are not known before its router runs, and its attention needs this layer's
+output, so the overlap left is inside a layer: resident experts (about 46% of the routed ones) could
+compute while the rest upload on a separate blit queue, or one micro-batch's layer L+1 could run
+while the next micro-batch is at layer L. Both change the graph; not attempted.
+
+Flash Next on one Vega II die: 2048 against 1024 gives pp4096 327.5 -> 350.6 t/s (7.0% faster),
+pp2048 346.2 -> 359.9; there the GPU compute (router wait 54 s) outweighs uploads.
