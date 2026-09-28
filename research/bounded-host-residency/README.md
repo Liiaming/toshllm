@@ -360,3 +360,62 @@ Qwen3.8 Flash Next UD-Q4_K_XL, one Radeon Pro Vega II die, Auto without DMoE arg
 
 Expert bytes read from three shards matched the loaded bank (576 checked, 0 differ), and 7866 slots
 promoted from the bounded cache verified against the file.
+
+## Real memory pressure, plan reporting and server memory (patch 0111)
+
+`memhold.c` now grows in 256 MiB steps and stops growing on critical pressure, swap growth or low
+free memory (`--mlock` wires what it holds); `pressure_step.py` holds N GiB, previews the Auto plan,
+loads with Auto and runs the workload (3.4K prompt, 12-turn chat, 2048-token decode) sampling RSS,
+VRAM, swap and compression; `plan_race.py` takes memory while Auto is planning.
+
+Qwen3.6-35B-A3B under real held memory (32 GiB machine, runtime policy, final 0111):
+
+| held | reclaimable | plan | RAM cache | HOT | coverage | projected RSS | RSS at end | footprint | 3.4K prompt | 12-turn prefill | chat decode | 2048 decode, p99 |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 26.6 | full host | | 6.3 | 1.37 | 21.89 | 22.21 | 17.77 | 547.8 | 354.1 | 42.73 | 49.02, 34.3 ms |
+| 4 | 21.6 | bounded | 15.2 | 6.3 | 1.26 | 16.88 | 16.73 | 15.68 | 365.5 | 334.5 | 38.78 | 39.32, 44.3 ms |
+| 8 | 19.3 | bounded | 12.9 | 6.3 | 1.12 | 14.59 | 13.01 | 13.66 | 365.8 | 289.0 | 31.28 | 31.17, 83.7 ms |
+| 11 | 16.9 | bounded (q8, ub 512) | 10.4 | 6.7 | 1.00 | 12.10 | 10.58 | 11.26 | 275.5 | 233.8 | 28.57 | 33.61, 67.3 ms |
+| 12-13 | 14-15 | unsupported, exit 1 | | | | | | | | | | |
+| released | 27.3 | full host | | 6.3 | 1.37 | 22.55 | 18.52 at ready | 17.77 | | | | |
+
+GiB and t/s. No swap was written in any step (1.53 GiB before and after), VRAM was 9.25 GiB against
+9.93 projected. The classic expert offload never won: with this card's free VRAM it needs as much
+host memory as a bounded cache at coverage 1.0, so Auto goes from bounded to unsupported. Gemma 4
+26B-A4B: full host at 0 and 6 GiB held, bounded at 10-12 (coverage 1.08-1.00), unsupported from 13.
+GPT-OSS and GLM stay on the full bank up to 8 GiB held and go bounded at 14.
+
+What the plan did not count, found by comparing projected and measured memory:
+
+- llama-server's RAM prompt cache (`--cache-ram`, 8 GiB by default) filled after ready: Qwen full
+  host ended at 22.2 GiB against 18.65 projected.
+- context checkpoints, up to 32 per slot, each holding the sliding-window cache of a sequence:
+  Gemma grew from 14.2 to 20.6 GiB with the prompt cache off, and wrote 2.1 GiB to swap during a
+  long decode with it on.
+
+The plan now gives both what its budget leaves, model first and checkpoints before the prompt
+cache (their size comes from the file's sliding-window metadata), lowers them when they do not
+fit, and counts them in the projection. Gemma full host then ended at 17.2 GiB against 21.2
+projected with no swap. RSS also counts clean file pages the system can drop: Flash Next reads
+115.5 GiB resident at ready but its footprint is 72.9 GiB against 108.2 projected, so the load
+report carries both.
+
+Compression in constrained bounded plans (1.4-2.4 GiB during a workload with 8-11 GiB held) is the
+server's own cold pages: runtime state written once after ready, which macOS compresses first when
+free memory is short. The holder alone at 8 GiB compresses nothing in 240 s. Pressure stayed
+normal and no swap was written.
+
+Planning takes 3.7 s of probes, so the plan checks memory again before committing: a 4 GiB
+allocation 1 s into planning moved reclaimable from 26.1 to 21.8 GiB, and 0111 planned again to a
+15.3 GiB bounded cache, where 0110 loaded the full bank from the old snapshot. A failed lock of the
+RAM cache now fails the load cleanly (ALLOCATION_FAILED, exit 1); it used to abort at exit with the
+lock thread still attached. A failed lock of the full bank keeps running with mixed execution off
+and says so (`runtime_code`).
+
+The plan JSON carries `plan_schema_version` 1 and a `product` object in bytes (mode, reason,
+warnings, limits, limiting resource, memory, dmoe, runtime, model, unsupported requirements);
+`<plan>.actual` has the load result (READY, PLAN_REFUSED, MODEL_LOAD_FAILED, ALLOCATION_FAILED,
+CONTEXT_FAILED) with projected and measured RSS, footprint and VRAM.
+
+Flash Next, one Vega II die, final 0111: pp512 302.7 t/s, tg128 23.10, 3.4K prompt 201.7, decode
+21.19, footprint 72.9 GiB, VRAM 26.6 GiB against 30.0 projected, no swap.
