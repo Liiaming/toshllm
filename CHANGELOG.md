@@ -19,6 +19,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **LLMs: the automatic memory plan now works with models split into several files, such as Qwen3.8 Flash Next.** On one Radeon Pro Vega II die it picks Dynamic MoE by itself and reads a 3,000-token prompt at 202 tokens a second, against 179 with the manual settings, and generates at the same 21.
 
+- **LLMs: with the automatic memory plan, long chats no longer push a Mixture-of-Experts model into swap.** The plan now leaves room for the conversation state the server keeps in memory: Gemma 4 26B-A4B on a 32 GB Mac wrote 2 GB to swap during a long chat and now writes none.
+
 - **LLMs: when no memory plan fits, the engine refuses to load the model and says why.** Before, it could fall back to the default settings, fill the GPU and stop answering, as Gemma 4 26B-A4B did on a machine short of free memory.
 
 ## [0.87.10] - 2026-09-25
