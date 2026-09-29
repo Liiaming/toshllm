@@ -127,7 +127,9 @@ final class VRAMMonitor: ObservableObject {
             }
             return nil
         }
-        return (number(["inUseVidMemoryBytes"]),
+        // Unified memory has no VRAM counter; "Alloc system memory" is what the GPU holds
+        // across processes, which is what recommendedMaxWorkingSetSize budgets.
+        return (number(["inUseVidMemoryBytes", "Alloc system memory", "In use system memory"]),
                 number(["Device Utilization %", "GPU Activity(%)"]),
                 number(["Temperature(C)"]),
                 number(["Total Power(W)"]))
