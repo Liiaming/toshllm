@@ -251,6 +251,7 @@ struct RichText: View {
     }
 
     private static func format(_ s: String) -> AttributedString {
+        let s = symbolizingMath(s)
         var attr = (try? AttributedString(markdown: s, options: .init(
             allowsExtendedAttributes: false,
             interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
@@ -270,6 +271,66 @@ struct RichText: View {
 
     static func looksLikeFormula(_ body: String) -> Bool {
         body.count <= 3 || body.contains { "\\^_{}".contains($0) }
+    }
+
+    /// LaTeX commands with a single Unicode glyph, so `$\neq$` renders as text
+    /// wherever the line is shown, not only in paragraphs.
+    static let mathSymbols: [String: String] = [
+        "to": "→", "rightarrow": "→", "leftarrow": "←", "gets": "←", "leftrightarrow": "↔",
+        "Rightarrow": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔", "implies": "⇒", "iff": "⇔",
+        "longrightarrow": "⟶", "longleftarrow": "⟵", "mapsto": "↦", "uparrow": "↑", "downarrow": "↓",
+        "neq": "≠", "ne": "≠", "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "approx": "≈",
+        "sim": "∼", "simeq": "≃", "equiv": "≡", "propto": "∝", "ll": "≪", "gg": "≫",
+        "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆", "supset": "⊃", "supseteq": "⊇",
+        "cup": "∪", "cap": "∩", "emptyset": "∅", "forall": "∀", "exists": "∃", "neg": "¬",
+        "land": "∧", "wedge": "∧", "lor": "∨", "vee": "∨", "times": "×", "cdot": "·", "div": "÷",
+        "pm": "±", "mp": "∓", "ast": "∗", "circ": "∘", "infty": "∞", "partial": "∂", "nabla": "∇",
+        "sum": "∑", "prod": "∏", "int": "∫", "ldots": "…", "dots": "…", "cdots": "⋯",
+        "degree": "°", "checkmark": "✓",
+        "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε",
+        "zeta": "ζ", "eta": "η", "theta": "θ", "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ",
+        "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "phi": "φ",
+        "varphi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω", "Gamma": "Γ", "Delta": "Δ",
+        "Theta": "Θ", "Lambda": "Λ", "Pi": "Π", "Sigma": "Σ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+    ]
+
+    private static let inlineMathRegex = try? NSRegularExpression(pattern: inlineMathPattern)
+    private static let mathCommandRegex = try? NSRegularExpression(pattern: #"\\([A-Za-z]+)"#)
+
+    /// Rewrites formulas made only of known symbols and plain operands (`$a \neq b$`)
+    /// as text; anything with scripts, braces or other commands is left for KaTeX.
+    /// Code spans are skipped.
+    static func symbolizingMath(_ value: String) -> String {
+        guard value.contains("\\"), let regex = inlineMathRegex, let commands = mathCommandRegex
+        else { return value }
+        let segments = value.components(separatedBy: "`")
+        return segments.enumerated().map { index, segment in
+            guard index.isMultiple(of: 2), segment.contains("\\") else { return segment }
+            var out = segment
+            let matches = regex.matches(in: segment, range: NSRange(segment.startIndex..., in: segment))
+            for match in matches.reversed() {
+                guard let whole = Range(match.range, in: out),
+                      let bodyRange = [1, 2].lazy.compactMap({ Range(match.range(at: $0), in: segment) }).first
+                else { continue }
+                let body = String(segment[bodyRange])
+                let ns = NSRange(body.startIndex..., in: body)
+                var text = body
+                var known = true
+                for command in commands.matches(in: body, range: ns).reversed() {
+                    guard let r = Range(command.range, in: text),
+                          let nameRange = Range(command.range(at: 1), in: body),
+                          let glyph = mathSymbols[String(body[nameRange])]
+                    else { known = false; break }
+                    text.replaceSubrange(r, with: glyph)
+                }
+                guard known, text != body,
+                      text.range(of: #"^[\p{L}\p{N}\p{Sm}\p{So}\s.,;:+\-=<>()\[\]|/*!'…·]*$"#,
+                                 options: .regularExpression) != nil
+                else { continue }
+                out.replaceSubrange(whole, with: text)
+            }
+            return out
+        }.joined(separator: "`")
     }
 
     static func containsInlineMath(_ value: String) -> Bool {
@@ -337,7 +398,7 @@ private struct MDBlockView: View, Equatable {
     var body: some View {
         switch block {
         case .paragraph(let s):
-            if RichText.containsInlineMath(s) {
+            if RichText.containsInlineMath(RichText.symbolizingMath(s)) {
                 InlineMathText(source: s)
             } else {
                 Text(RichText.inline(s)).textSelection(.enabled)

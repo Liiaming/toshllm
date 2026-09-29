@@ -40,6 +40,24 @@ final class InlineMathDetectionTests: XCTestCase {
         XCTAssertFalse(RichText.containsInlineMath("Revisa $LOG_FILE antes de continuar."))
     }
 
+    func testSymbolOnlyFormulasBecomeText() {
+        XCTAssertEqual(RichText.symbolizingMath("a $\\neq$ b"), "a ≠ b")
+        XCTAssertEqual(RichText.symbolizingMath("**Paso 1 $\\rightarrow$ Paso 2**"), "**Paso 1 → Paso 2**")
+        XCTAssertEqual(RichText.symbolizingMath("si $x \\leq y$ y $\\alpha$"), "si x ≤ y y α")
+        XCTAssertFalse(RichText.containsInlineMath(RichText.symbolizingMath("Entonces $a \\neq b$.")))
+    }
+
+    func testRealFormulasAndCodeAreLeftAlone() {
+        for text in [
+            "The area is $A = \\pi r^2$ for a circle.",
+            "Suma $\\sum_{i=1}^n i$ en total.",
+            "Usa $\\frac{a}{b}$ aqui.",
+            "Escribe `$\\neq$` literal.",
+        ] {
+            XCTAssertEqual(RichText.symbolizingMath(text), text, text)
+        }
+    }
+
     func testSpanDoesNotCrossLines() {
         XCTAssertFalse(RichText.containsInlineMath("Primero $HOME\ny luego $PATH del sistema."))
     }
