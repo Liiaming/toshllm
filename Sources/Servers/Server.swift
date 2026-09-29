@@ -553,6 +553,21 @@ struct ServerSettings {
         return choices.isEmpty ? [lowest] : choices
     }
 
+    /// KV types to offer: only f16/q8_0/q4_0 have an FA-AMD kernel, turbo only where the
+    /// model supports it. A type already selected stays listed so the field is not blank.
+    static func kvTypeChoices(modelPath: String, selected: [String]) -> [String] {
+        kvTypeChoices(supportsTurbo: !isAppleSilicon && !modelPath.isEmpty && modelSupportsTurboKV(at: modelPath),
+                      selected: selected)
+    }
+
+    static func kvTypeChoices(supportsTurbo: Bool, selected: [String]) -> [String] {
+        var types = ["f16", "q8_0", "q4_0"]
+        if isAppleSilicon { return types }
+        if supportsTurbo { types += ["turbo4", "turbo3"] }
+        for t in selected where !types.contains(t) { types.append(t) }
+        return types
+    }
+
     static func contextLabel(_ tokens: Int) -> String {
         tokens >= 1048576 && tokens % 1048576 == 0 ? "\(tokens / 1048576)M" : "\(tokens / 1024)k"
     }

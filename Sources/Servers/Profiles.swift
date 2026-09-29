@@ -51,6 +51,7 @@ struct Profile: Codable, Identifiable {
     var routerMode: Bool? = nil
     var routerModelsMax: Int? = nil
     var ubatch: Int? = nil
+    var autoKVMode: String? = nil
     /// Added servers inherit the global settings except these fields. nil (any
     /// profile saved before this existed) means every field applies, as before.
     var pinned: [String]? = nil
@@ -67,6 +68,7 @@ struct Profile: Codable, Identifiable {
         static let uiMcpProxy  = "uiMcpProxy"
         static let router     = "router"
         static let ubatch     = "ubatch"
+        static let kv         = "kv"
         static let parallelSlots = "parallelSlots"
         static let extraArgs  = "extraArgs"
     }
@@ -156,6 +158,7 @@ final class ProfileStore: ObservableObject {
         d.set(p.extraArgs, forKey: SettingsKeys.extraArgs)
         d.set(p.cacheTypeK, forKey: SettingsKeys.cacheTypeK)
         d.set(p.cacheTypeV, forKey: SettingsKeys.cacheTypeV)
+        if let v = p.autoKVMode { d.set(v, forKey: SettingsKeys.autoKVMode) }
         d.set(p.mlock, forKey: SettingsKeys.mlock)
         d.set(p.port, forKey: SettingsKeys.port)
         if let mtp = p.specMTP { d.set(mtp, forKey: SettingsKeys.specMTP) }
@@ -241,7 +244,7 @@ extension ServerSettings {
                 localNetworkDiscovery: localNetworkDiscovery,
                 gpuList: gpuList, embeddings: embeddings, uiMcpProxy: uiMcpProxy,
                 routerMode: routerMode, routerModelsMax: routerModelsMax,
-                ubatch: ubatch)
+                ubatch: ubatch, autoKVMode: autoKVMode)
     }
 
     /// Load a profile's config into this struct without touching UserDefaults,
@@ -259,6 +262,7 @@ extension ServerSettings {
         if let v = p.parallelSlots { parallelSlots = v }
         if let v = p.faAmd { faAmd = v }
         if let v = p.ubatch { ubatch = v }
+        if let v = p.autoKVMode { autoKVMode = v }
         if let v = p.dynamicMoeEnabled { dynamicMoeEnabled = v }
         if let v = p.persistCache { persistCache = v }
         if let v = p.multiGPU { multiGPU = v }
@@ -296,6 +300,10 @@ extension ServerSettings {
             if let value = p.faAmd { faAmd = value }
         }
         if pinned.contains(Profile.Pin.ubatch), let v = p.ubatch { ubatch = v }
+        if pinned.contains(Profile.Pin.kv) {
+            cacheTypeK = p.cacheTypeK; cacheTypeV = p.cacheTypeV
+            if let v = p.autoKVMode { autoKVMode = v }
+        }
         if pinned.contains(Profile.Pin.parallelSlots), let v = p.parallelSlots { parallelSlots = v }
         if pinned.contains(Profile.Pin.gpu) { gpuIndex = p.gpuIndex; gpuList = p.gpuList ?? [] }
         if pinned.contains(Profile.Pin.discovery), let v = p.localNetworkDiscovery { localNetworkDiscovery = v }

@@ -71,15 +71,7 @@ struct SettingsView: View {
     @State private var settingsDestination: SettingsDestination = .general
 
     private var availableKVTypes: [String] {
-        // Only f16/q8_0/q4_0 have an FA-AMD KV kernel; the rest fall back to a much
-        // slower path. An already-selected type stays listed so the field is not blank.
-        if ServerSettings.isAppleSilicon { return ["f16", "q8_0", "q4_0"] }
-        var types = ["f16", "q8_0", "q4_0"]
-        if !modelPath.isEmpty && ServerSettings.modelSupportsTurboKV(at: modelPath) {
-            types += ["turbo4", "turbo3"]
-        }
-        for t in [cacheTypeK, cacheTypeV] where !types.contains(t) { types.append(t) }
-        return types
+        ServerSettings.kvTypeChoices(modelPath: modelPath, selected: [cacheTypeK, cacheTypeV])
     }
     /// Why the chosen Turbo combination cannot run, so the warning names the actual cause
     /// instead of listing every reason Turbo might be unavailable.
