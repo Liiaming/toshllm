@@ -141,7 +141,7 @@ A 2021 card holds its own: it trails the M3 Max on short prompts, leads it from 
 - An Intel Mac with an AMD GPU that supports Metal (developed and tuned on an RX 6700 XT 12 GB)
 - 16 GB RAM minimum — 32 GB recommended for 35B-class MoE models
 
-> **Hackintosh note:** AMD RDNA 2 dGPUs work great with the [NootRX](https://github.com/ChefKissInc/NootRX) kext providing Metal support. ToshLLM runs on top of any working Metal setup.
+> **Hackintosh note:** AMD RDNA 2 dGPUs work great with the [NootRX](https://github.com/ChefKissInc/NootRX) kext providing Metal support. ToshLLM runs on top of any working Metal setup. If your OpenCore config injects `ATY,Henbury` in `DeviceProperties`, try removing it: on an RX 6600 XT it cut generation from about 20 to 14 tokens a second ([#44](https://github.com/engeldlgado/toshllm/issues/44)). It was a workaround for macOS 12.3 and is only needed if your displays depend on it.
 
 ## Good to know
 
@@ -444,7 +444,7 @@ Descarga el `.dmg` desde [Releases](https://github.com/engeldlgado/toshllm/relea
 ### Requisitos y notas
 
 - macOS 14 o posterior · Mac Intel con GPU AMD compatible con Metal · 16 GB de RAM mínimo (32 GB recomendado para MoE de 35B).
-- **Hackintosh:** las GPUs AMD RDNA 2 funcionan muy bien con el kext [NootRX](https://github.com/ChefKissInc/NootRX).
+- **Hackintosh:** las GPUs AMD RDNA 2 funcionan muy bien con el kext [NootRX](https://github.com/ChefKissInc/NootRX). Si tu configuración de OpenCore inyecta `ATY,Henbury` en `DeviceProperties`, prueba a quitarlo: en una RX 6600 XT bajaba la generación de unos 20 a 14 tokens por segundo ([#44](https://github.com/engeldlgado/toshllm/issues/44)). Era un parche para macOS 12.3 y solo hace falta si tus pantallas dependen de él.
 - **Beta:** funciona para uso diario pero pueden aparecer detalles por pulir; reporta lo que encuentres en [Issues](https://github.com/engeldlgado/toshllm/issues) (exporta diagnósticos desde Ajustes → Registro del servidor).
 - **Limitaciones conocidas:** los clientes externos (VS Code, Cline…) envían un prompt fijo de 15-19k tokens en cada petición, lo que en frío satura la GPU varios minutos (el chat integrado no se ve afectado). Los modelos MoE grandes con offload antes ahogaban al driver AMD y se estancaban a mitad de generación; **0.81.49 lo solucionó** con un buffer de staging persistente y ahora corren estables y planos (confirmado en RX 6700 XT y en el Mac Pro de dos GPUs de un tester). Queda un watchdog como red de seguridad.
 - **Caché con visión:** `llama.cpp` no permite guardar/restaurar slots ni usar cache-reuse mientras hay un `mmproj` cargado. ToshLLM desactiva esas funciones automáticamente para modelos de visión; la caché normal en memoria sigue funcionando.

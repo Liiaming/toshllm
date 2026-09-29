@@ -3,6 +3,24 @@
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **A donate button in the toolbar.**
+
+### Improved
+
+- **LLMs: the KV cache type can be chosen on each server's page, also under Dynamic MoE.** Quantizing the keys to q8_0 fits about a third more context in the same memory.
+
+### Fixed
+
+- **LLMs: math symbols such as `$\neq$` or `$\rightarrow$` render in headings, lists, quotes and tables, not only in paragraphs.**
+
+- **LLMs: the GPU memory readout shows what is in use on Macs with unified memory instead of 0.**
+
+- **UI improvements and fixes.**
+
 ## [0.87.11] - 2026-09-28
 
 ### Added

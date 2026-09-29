@@ -261,6 +261,8 @@ La generación de modelos MoE híbridos está limitada por el ancho de banda de 
 
 **Va muy lento (2-8 t/s)** — Activa "Copiar pesos a VRAM (--no-mmap)". Si ya está activo, la VRAM puede estar saturada: sube "Expertos MoE en CPU" un par de capas.
 
+**Hackintosh más lento de lo esperado** — Si OpenCore inyecta `ATY,Henbury` en `DeviceProperties`, prueba a quitarlo: en una RX 6600 XT la generación subió de 14 a 20 t/s.
+
 **La velocidad colapsa de repente** — VRAM desbordada. Sube el ncmoe o reduce el contexto.
 
 **El modelo no carga** — Puede ser una arquitectura demasiado nueva para el motor. Prueba el motor Integrado (es el más actualizado). Las variantes "MTP" requieren motores recientes.
@@ -504,6 +506,8 @@ Hybrid MoE generation is RAM-bandwidth-bound: a faster GPU won't improve it, but
 **Output is gibberish** — Save the server log and report the model, quantization and GPU; the bundled engine already applies the discrete-GPU safety mode.
 
 **Very slow (2-8 t/s)** — Enable "Copy weights to VRAM (--no-mmap)". If already on, VRAM may be saturated: raise "MoE experts on CPU" a couple of layers.
+
+**Hackintosh slower than expected** — If OpenCore injects `ATY,Henbury` in `DeviceProperties`, try removing it: on an RX 6600 XT generation went from 14 to 20 t/s.
 
 **Speed suddenly collapses** — VRAM overflow. Raise ncmoe or reduce context.
 
