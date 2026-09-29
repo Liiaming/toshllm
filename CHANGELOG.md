@@ -5,10 +5,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.87.12] - 2026-09-29
 
-### Added
-
-- **A donate button in the toolbar.**
-
 ### Improved
 
 - **LLMs: the KV cache type can be chosen on each server's page, also under Dynamic MoE.** Quantizing the keys to q8_0 fits about a third more context in the same memory.
