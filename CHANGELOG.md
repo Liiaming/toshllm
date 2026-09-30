@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **LLMs: default reasoning level and response limit for requests that bring none.** In Settings, next to Reasoning as plain text: VS Code and agents that send no level or no max_tokens get these, and a request that sets its own still wins.
+
 - **LLMs: a context recall test in Benchmarks.** It hides a code at 10%, 50% and 90% of a 8K, 32K or 128K text and asks the running server for it back, to check that a quantized KV cache or a long context still remembers what it read.
 
 ### Improved

@@ -63,6 +63,9 @@ struct ServerSettings {
     /// Emit reasoning inline in `content` (<think>…) instead of the separate
     /// `reasoning_content` field, for external clients that ignore the latter.
     var reasoningInline: Bool = false
+    /// Defaults for requests that bring none (external clients); a request's own value wins.
+    var defaultReasoning: String = "model"
+    var defaultMaxTokens: Int = 0
     /// Server slots (0 = engine auto). With 1, requests queue instead of competing
     /// for the GPU, and a prefill aborted by a client timeout stays in the slot so
     /// the retry resumes where it left off.
@@ -339,6 +342,8 @@ struct ServerSettings {
             args += ["--slot-save-path", Self.slotCacheDir(port: port).path]
         }
         if reasoningInline { args += ["--reasoning-format", "none"] }
+        if let kwargs = defaultTemplateKwargs { args += ["--chat-template-kwargs", kwargs] }
+        if defaultMaxTokens > 0 { args += ["-n", String(defaultMaxTokens)] }
         if apiKeyEnabled { args += ["--api-key", Keychain.apiKey()] }
         // A compatible downloaded DFlash draft takes precedence over embedded MTP.
         // Dynamic MoE plans memory without a separate draft model, so DFlash only joins a
@@ -470,6 +475,8 @@ struct ServerSettings {
                 lines.append("slot-save-path = \(slotDir.path)")
             }
             if reasoningInline { lines.append("reasoning-format = none") }
+            if let kwargs = defaultTemplateKwargs { lines.append("chat-template-kwargs = \(kwargs)") }
+            if defaultMaxTokens > 0 { lines.append("n-predict = \(defaultMaxTokens)") }
             if let selection = dflashSelection(modelPath: path, ncmoe: ncmoeByPath[path] ?? 0) {
                 lines.append("model-draft = \(selection.draft)")
                 lines.append("spec-type = draft-dflash")
@@ -812,6 +819,8 @@ struct ServerSettings {
             mlock: bool(SettingsKeys.mlock, false),
             cacheRAM: int(SettingsKeys.cacheRAM, 2048),
             reasoningInline: bool(SettingsKeys.reasoningInline, false),
+            defaultReasoning: d.string(forKey: SettingsKeys.serverDefaultReasoning) ?? "model",
+            defaultMaxTokens: int(SettingsKeys.serverDefaultMaxTokens, 0),
             parallelSlots: int(SettingsKeys.parallelSlots, 1),
             apiKeyEnabled: bool(SettingsKeys.apiKeyEnabled, false),
             localNetworkDiscovery: bool(SettingsKeys.localNetworkDiscovery, false),
@@ -889,6 +898,14 @@ struct ServerSettings {
         guard ubatch > 0 else { return nil }
         guard routerMode || Self.modelIsMoE(at: modelPath) else { return nil }
         return ubatch
+    }
+    /// Template defaults for requests that set none; the request's own kwargs override them key by key.
+    var defaultTemplateKwargs: String? {
+        switch defaultReasoning {
+        case "off": return #"{"enable_thinking":false}"#
+        case "low", "medium", "high": return #"{"enable_thinking":true,"reasoning_effort":"\#(defaultReasoning)"}"#
+        default: return nil
+        }
     }
     /// The engine plans memory: MoE models under Auto or forced Dynamic MoE, on one GPU.
     var usesAutoPlan: Bool {

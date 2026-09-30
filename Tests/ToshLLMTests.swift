@@ -1177,6 +1177,20 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(args[args.firstIndex(of: "--reasoning-format")! + 1], "none")
     }
 
+    func testServerDefaultsForRequestsThatBringNone() {
+        var s = makeSettings()
+        XCTAssertFalse(s.arguments.contains("--chat-template-kwargs"), "the model's own default adds nothing")
+        XCTAssertFalse(s.arguments.contains("-n"))
+        s.defaultReasoning = "off"
+        s.defaultMaxTokens = 4096
+        var args = s.arguments
+        XCTAssertEqual(args[args.firstIndex(of: "--chat-template-kwargs")! + 1], #"{"enable_thinking":false}"#)
+        XCTAssertEqual(args[args.firstIndex(of: "-n")! + 1], "4096")
+        s.defaultReasoning = "high"
+        args = s.arguments
+        XCTAssertEqual(args[args.firstIndex(of: "--chat-template-kwargs")! + 1], #"{"enable_thinking":true,"reasoning_effort":"high"}"#)
+    }
+
     func testVisionModelDisablesCacheReuseAndDetectsMultimodal() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("toshllm-vision-\(UUID().uuidString)")

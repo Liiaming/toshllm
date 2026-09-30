@@ -108,6 +108,10 @@ enum SettingsKeys {
     static let cacheRAM = "cacheRAM"
     static let parallelSlots = "parallelSlots"
     static let reasoningInline = "reasoningInline"
+    /// Reasoning level for requests that do not choose one: "model", "off", "low", "medium", "high".
+    static let serverDefaultReasoning = "serverDefaultReasoning"
+    /// Response token limit for requests that do not set one; 0 leaves it to the engine.
+    static let serverDefaultMaxTokens = "serverDefaultMaxTokens"
     static let specMTP = "specMTP"
     static let faAmd = "faAmd"
     static let prefetchExperts = "prefetchExperts"
@@ -253,7 +257,7 @@ enum SettingsKeys {
         extraArgs, embeddings, agentToolsEnabled, toolsRuntime, jsSandboxEnabled, toolResultLimit,
         memoryToolsEnabled, toolsUnsupportedModels, mcpServers, uiMcpProxy,
         cacheTypeK, cacheTypeV, mlock, cacheRAM,
-        parallelSlots, reasoningInline, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
+        parallelSlots, reasoningInline, serverDefaultReasoning, serverDefaultMaxTokens, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
         dynamicMoeEnabled, routerMode, routerModelsMax,
         persistCache, multiGPU, multiGPUCount, splitMode, splitGroupSize, mgpuEvents, mgpuPeer,
         forcePrivateBuffers, cacheReuse, apiKeyEnabled, localNetworkDiscovery,
