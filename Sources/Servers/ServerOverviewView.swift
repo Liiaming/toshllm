@@ -28,7 +28,7 @@ struct ServerOverviewView: View {
                     .font(.system(size: 10, weight: .semibold)).tracking(1.7)
                     .foregroundStyle(server.state == .running ? .green : .secondary)
                 Spacer()
-                ServerStateBadge(state: server.state)
+                ServerStateBadge(state: server.state, phase: server.startupPhase, since: server.startupPhaseSince)
             }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 24) {

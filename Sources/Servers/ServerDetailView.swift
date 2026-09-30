@@ -244,7 +244,7 @@ private struct ServerDetailHero: View {
     private var statusSummary: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
             VStack(alignment: .leading, spacing: 3) {
-                ServerStateBadge(state: server.state)
+                ServerStateBadge(state: server.state, phase: server.startupPhase, since: server.startupPhaseSince)
                     .font(.system(size: 15, weight: .semibold))
                 if let started = server.startedAt {
                     Text(loc.t("Activo durante %@", "Uptime %@", duration(from: started, to: context.date)))

@@ -412,7 +412,7 @@ struct DashboardView: View {
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(WorkspaceStyle.border))
 
             HStack {
-                ServerStateBadge(state: server.state)
+                ServerStateBadge(state: server.state, phase: server.startupPhase, since: server.startupPhaseSince)
                 Spacer()
                 ServerWebUIButton(server: server, presentation: .icon)
                 if server.state == .running || server.state == .starting {
@@ -759,6 +759,8 @@ struct GPUUsageBadge: View {
 /// Compact server state indicator, shared by the main and the added server cards.
 struct ServerStateBadge: View {
     let state: ServerController.State
+    var phase: ServerController.StartupPhase? = nil
+    var since: Date? = nil
     @EnvironmentObject var loc: Localizer
     var body: some View {
         switch state {
@@ -766,8 +768,17 @@ struct ServerStateBadge: View {
             Label(loc.t("Activo", "Running"), systemImage: "circle.fill")
                 .foregroundStyle(.green).font(.caption)
         case .starting:
-            Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
-                .foregroundStyle(.orange).font(.caption)
+            if let phase, let since {
+                TimelineView(.periodic(from: since, by: 1)) { context in
+                    Label("\(phaseTitle(phase)) · \(Int(context.date.timeIntervalSince(since)))s", systemImage: "circle.fill")
+                        .foregroundStyle(.orange).font(.caption)
+                        .monospacedDigit()
+                }
+                .help(phaseHelp(phase))
+            } else {
+                Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
+                    .foregroundStyle(.orange).font(.caption)
+            }
         case .failed(let msg):
             Label(loc.t("Error", "Error"), systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red).font(.caption)
@@ -775,6 +786,31 @@ struct ServerStateBadge: View {
         case .stopped:
             Label(loc.t("Detenido", "Stopped"), systemImage: "circle")
                 .foregroundStyle(.secondary).font(.caption)
+        }
+    }
+
+    private func phaseTitle(_ phase: ServerController.StartupPhase) -> String {
+        switch phase {
+        case .planning:       return loc.t("Planificando memoria", "Planning memory")
+        case .loadingWeights: return loc.t("Cargando pesos", "Loading weights")
+        case .lockingMemory:  return loc.t("Reservando RAM para expertos", "Reserving RAM for experts")
+        case .fillingCache:   return loc.t("Preparando expertos", "Preparing experts")
+        }
+    }
+
+    private func phaseHelp(_ phase: ServerController.StartupPhase) -> String {
+        switch phase {
+        case .planning:
+            return loc.t("El motor mide cuánta VRAM y RAM hay libres para decidir cómo repartir el modelo.",
+                         "The engine measures free VRAM and RAM to decide how to split the model.")
+        case .loadingWeights:
+            return loc.t("Leyendo el modelo del disco a la GPU.", "Reading the model from disk into the GPU.")
+        case .lockingMemory:
+            return loc.t("Dynamic MoE reserva RAM para los expertos. Mientras tanto el Mac puede ir más lento.",
+                         "Dynamic MoE is reserving RAM for the experts. The Mac may feel slower meanwhile.")
+        case .fillingCache:
+            return loc.t("Cargando en RAM los expertos más usados antes de la primera respuesta.",
+                         "Loading the most used experts into RAM before the first answer.")
         }
     }
 }
@@ -1004,7 +1040,7 @@ struct AddedServerCard: View {
             .background(WorkspaceStyle.inset.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(WorkspaceStyle.border))
             HStack {
-                ServerStateBadge(state: c.state)
+                ServerStateBadge(state: c.state, phase: c.startupPhase, since: c.startupPhaseSince)
                 Spacer()
                 ServerWebUIButton(server: c)
                 if busy {

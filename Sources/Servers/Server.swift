@@ -1551,7 +1551,20 @@ final class ServerController: ObservableObject {
 
     enum State: Equatable { case stopped, starting, running, failed(String) }
 
-    @Published var state: State = .stopped
+    @Published var state: State = .stopped {
+        didSet { if state != .starting { enterStartupPhase(nil) } }
+    }
+
+    /// What a starting engine is doing, read from its log, so a long load is not a silent spinner.
+    enum StartupPhase: Equatable { case planning, loadingWeights, lockingMemory, fillingCache }
+    @Published private(set) var startupPhase: StartupPhase?
+    @Published private(set) var startupPhaseSince: Date?
+
+    private func enterStartupPhase(_ phase: StartupPhase?) {
+        guard startupPhase != phase else { return }
+        startupPhase = phase
+        startupPhaseSince = phase == nil ? nil : Date()
+    }
     let logBuffer = ServerLogBuffer()
     var log: String {
         get { logBuffer.text }
@@ -1718,6 +1731,7 @@ final class ServerController: ObservableObject {
         stopDiscovery()
         state = .starting
         startedAt = nil
+        enterStartupPhase(settings.usesAutoPlan ? .planning : .loadingWeights)
 
         // A stopped engine can take seconds to die (SIGTERM mid-generation) and still
         // holds the port meanwhile, so wait for the previous PID before binding.
@@ -2331,6 +2345,15 @@ final class ServerController: ObservableObject {
         fileLog.append(text)
 
         for line in text.split(separator: "\n") {
+            if state == .starting {
+                if line.contains("Tosh Dynamic MoE: mode=") || (line.contains("load_model: loading model") && startupPhase == .planning) {
+                    enterStartupPhase(.loadingWeights)
+                } else if line.contains("MiB locked for experts") || line.contains("expert bank locked") {
+                    enterStartupPhase(.lockingMemory)
+                } else if line.contains("tosh_hostcache: ready") {
+                    enterStartupPhase(.fillingCache)
+                }
+            }
             if line.contains("mixed expert execution failed"), !recoveredFromExecutorFailure,
                state == .running, let settings = launchedSettings {
                 recoveredFromExecutorFailure = true
