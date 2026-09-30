@@ -112,3 +112,81 @@ index b81dd95f2..a611042bf 100644
      // supports preserve reasoning trace in the full history, not just the last assistant message
      bool supports_preserve_reasoning = false;
  
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 2ff790a5d..da0d7e42b 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1346,10 +1346,17 @@ json oaicompat_chat_params_parse(
+     }
+ 
+     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
+     if (body.contains("reasoning_effort")) {
+         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
++        // clients spell the levels many ways, and a template that does not know one raises on it
++        std::transform(reasoning_effort.begin(), reasoning_effort.end(), reasoning_effort.begin(), ::tolower);
++        if (reasoning_effort == "off" || reasoning_effort == "minimal" || reasoning_effort == "disabled" || reasoning_effort == "false") {
++            reasoning_effort = "none";
++        } else if (reasoning_effort == "max" || reasoning_effort == "maximum") {
++            reasoning_effort = "high";
++        }
+         if (reasoning_effort == "none") {
+             inputs.enable_thinking = false;
+             inputs.chat_template_kwargs.erase("reasoning_effort");
+         } else if (!reasoning_effort.empty()) {
+             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 274af9b05..c1562861a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4379,30 +4379,46 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         }
+     } else {
+         // in streaming mode, the first error must be treated as non-stream response
+         // this is to match the OAI API behavior
+         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+-        auto first_result = rd.next(req.should_stop);
+-        if (first_result == nullptr) {
++        // a long prompt sends nothing until its first token and clients drop the connection: past
++        // the ping interval the stream opens with a ping, and a later error arrives inside it
++        bool first_timeout = false;
++        const int64_t first_wait = ggml_time_ms();
++        auto first_result = rd.next([&]() {
++            if (req.should_stop()) {
++                return true;
++            }
++            if (sse_ping_interval > 0 && ggml_time_ms() - first_wait > (int64_t) sse_ping_interval * 1000) {
++                first_timeout = true;
++                return true;
++            }
++            return false;
++        });
++        if (first_result == nullptr && !first_timeout) {
+             GGML_ASSERT(req.should_stop());
+             return res; // connection is closed
+         }
+ 
+-        if (first_result->is_error()) {
++        if (first_result != nullptr && first_result->is_error()) {
+             res->error(first_result->to_json());
+             return res;
+         }
+ 
+         GGML_ASSERT(
++            first_result == nullptr ||
+             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+         );
+ 
+         // next responses are streamed
+         // to be sent immediately
+-        json first_result_json = first_result->to_json();
+-        if (first_result_json == nullptr) {
++        json first_result_json = first_result != nullptr ? first_result->to_json() : json();
++        if (first_result == nullptr) {
++            res->data = ":\n\n";
++        } else if (first_result_json == nullptr) {
+             res->data = ""; // simply send HTTP headers and status code
+         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+             res->data = format_anthropic_sse(first_result_json);
+         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+             res->data = format_oai_resp_sse(first_result_json);
