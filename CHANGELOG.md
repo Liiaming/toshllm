@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Improved
 
+- **LLMs: Q2_0 models, such as the GSQ-RCO quantizations, compute the experts that run on the CPU 6.5 times faster on Intel Macs with AVX2.** The result is the same bit for bit.
+
 - **LLMs: the MTP head of Qwen 3.5 to 3.8 models scores its guesses over the 151K most common tokens instead of the whole 248K vocabulary.** On a Radeon RX 6700 XT, Qwen3.8-9B writes prose and code 3 to 5% faster.
 
 - **LLMs: with an MTP head, Dynamic MoE reads the weights of an expert once when several drafted tokens use it.** On a Mac Pro with a Radeon Pro Vega II, the CPU part of each layer takes 15% less and Qwen3.6-35B-A3B writes code 2% faster.
