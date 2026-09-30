@@ -14,6 +14,7 @@ struct ChatAdvancedSettingsSection: View {
     @AppStorage(SettingsKeys.toolsRuntime) private var toolsRuntime = ""
     @AppStorage(SettingsKeys.jsSandboxEnabled) private var jsSandboxEnabled = false
     @AppStorage(SettingsKeys.memoryToolsEnabled) private var memoryToolsEnabled = true
+    @AppStorage(SettingsKeys.toolResultLimit) private var toolResultLimit = ToolResultLimit.defaultCharacters
     @State private var blockedToolModels: [String] = ToolSupport.blockedModels
     @AppStorage(SettingsKeys.memoryArchiveHookURL) private var archiveHookURL = ""
     @AppStorage(SettingsKeys.memoryArchiveHookSecret) private var archiveHookSecret = ""
@@ -253,6 +254,12 @@ struct ChatAdvancedSettingsSection: View {
                                    value: $agenticMaxTurns, range: 1...100,
                                    help: loc.t("Máximo de rondas herramienta→respuesta que el agente encadena en un turno antes de detenerse.",
                                                "Maximum tool→response rounds the agent chains in one turn before stopping."))
+                    integerStepper(loc.t("Tope del resultado de una herramienta", "Tool result limit"),
+                                   icon: "scissors",
+                                   value: $toolResultLimit, range: 0...200_000, step: 5_000,
+                                   zeroLabel: loc.t("Sin tope", "None"),
+                                   help: loc.t("Caracteres de cada resultado de herramienta que llegan al modelo. Si se pasa, se envían el principio y el final con una nota de lo recortado; la tarjeta de la herramienta sigue mostrando el resultado entero. Evita que una página web o un listado grande llene el contexto. 0 lo envía entero.",
+                                               "Characters of each tool result that reach the model. Longer results send the beginning and the end with a note of what was cut; the tool card still shows the whole result. Keeps one web page or large listing from filling the context. 0 sends it whole."))
                     if !blockedToolModels.isEmpty {
                         SettingsRow(icon: "hammer.slash",
                                     title: loc.t("Modelos sin herramientas", "Models without tools"),
@@ -454,7 +461,7 @@ struct ChatAdvancedSettingsSection: View {
         backendSampling = false; customJSON = ""; agenticMaxTurns = 10; pasteLongTextLength = 2500
         maxImageMegapixels = 1; pdfAsImages = false
         autoCompact = true; smoothTyping = true; agentToolsEnabled = false; jsSandboxEnabled = false
-        memoryToolsEnabled = true; toolsRuntime = ""
+        memoryToolsEnabled = true; toolsRuntime = ""; toolResultLimit = ToolResultLimit.defaultCharacters
         archiveHookURL = ""; archiveHookSecret = ""
     }
 }

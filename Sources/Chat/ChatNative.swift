@@ -1278,7 +1278,8 @@ final class ChatStore: ObservableObject {
                 }
                 guard !Task.isCancelled else { return }
                 self?.completeToolCall(request, result: result.content,
-                                       state: result.isError ? .failed : .completed)
+                                       state: result.isError ? .failed : .completed,
+                                       imageURIs: result.imageURIs)
                 self?.advanceToolPermissions(conversation: request.conversationID)
             } catch {
                 guard !Task.isCancelled else { return }
@@ -1300,7 +1301,7 @@ final class ChatStore: ObservableObject {
     }
 
     private func completeToolCall(_ request: PendingToolPermission, result: String,
-                                  state: ChatToolCallState) {
+                                  state: ChatToolCallState, imageURIs: [String] = []) {
         guard let i = conversations.firstIndex(where: { $0.id == request.conversationID }),
               let j = conversations[i].messages.firstIndex(where: { $0.id == request.messageID }),
               let k = conversations[i].messages[j].toolCalls?.firstIndex(where: { $0.id == request.callID })
@@ -1309,7 +1310,10 @@ final class ChatStore: ObservableObject {
         conversations[i].messages[j].toolCalls?[k].result = result
         conversations[i].messages[j].toolCalls?[k].finishedAt = Date()
         let serverID = conversations[i].messages[j].toolCalls?[k].serverID ?? request.callID.uuidString
-        conversations[i].messages.append(ChatMessage(role: "tool", content: result, toolCallID: serverID))
+        // The card keeps the whole output; only what the model reads is capped.
+        conversations[i].messages.append(ChatMessage(role: "tool", content: ToolResultLimit.apply(result),
+                                                     toolCallID: serverID,
+                                                     imageURIs: imageURIs.isEmpty ? nil : imageURIs))
         conversations[i].updated = Date()
         save()
     }
@@ -1449,7 +1453,12 @@ final class ChatStore: ObservableObject {
         history += messages[safeStart...].enumerated().compactMap { offset, m -> [String: Any]? in
             guard !skipped.contains(safeStart + offset) else { return nil }
             if m.role == "tool", let callID = m.toolCallID {
-                return ["role": "tool", "tool_call_id": callID, "content": m.content]
+                guard let uris = m.imageURIs, !uris.isEmpty, modalities?.vision != false else {
+                    return ["role": "tool", "tool_call_id": callID, "content": m.content]
+                }
+                var parts: [[String: Any]] = [["type": "text", "text": m.content]]
+                parts += uris.map { ["type": "image_url", "image_url": ["url": $0]] }
+                return ["role": "tool", "tool_call_id": callID, "content": parts]
             }
             let text = m.role == "assistant" ? m.parts.body : m.wireContent
             if m.role == "assistant", let calls = m.toolCalls, !calls.isEmpty {

@@ -91,6 +91,8 @@ enum SettingsKeys {
     static let agentToolsEnabled = "agentToolsEnabled"
     static let toolsRuntime = "toolsRuntime"
     static let jsSandboxEnabled = "jsSandboxEnabled"
+    /// Characters of a tool result that reach the model; 0 sends it whole.
+    static let toolResultLimit = "toolResultLimit"
     /// memory_list / memory_archive / memory_recall. Off for setups where an
     /// external memory server already covers the job and the model mixes the two.
     static let memoryToolsEnabled = "memoryToolsEnabled"
@@ -248,7 +250,7 @@ enum SettingsKeys {
         audioGlossary, audioTranslationModel, audioVADMode,
         audioVADProfile, audioVADThreshold, audioVADMinSpeechMS,
         audioVADMinSilenceMS, audioVADMaxSpeechSeconds, audioVADSpeechPadMS,
-        extraArgs, embeddings, agentToolsEnabled, toolsRuntime, jsSandboxEnabled,
+        extraArgs, embeddings, agentToolsEnabled, toolsRuntime, jsSandboxEnabled, toolResultLimit,
         memoryToolsEnabled, toolsUnsupportedModels, mcpServers, uiMcpProxy,
         cacheTypeK, cacheTypeV, mlock, cacheRAM,
         parallelSlots, reasoningInline, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,

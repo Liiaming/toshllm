@@ -63,15 +63,36 @@ actor ToshMCPService {
             "name": name, "arguments": arguments
         ])
         let items = result["content"] as? [[String: Any]] ?? []
+        var images: [String] = []
         let content = items.compactMap { item -> String? in
             if let text = item["text"] as? String { return text }
             if let resource = item["resource"] as? [String: Any] {
-                return resource["text"] as? String ?? resource["blob"] as? String
+                if let text = resource["text"] as? String { return text }
+                guard let blob = resource["blob"] as? String else { return nil }
+                let mime = resource["mimeType"] as? String ?? "application/octet-stream"
+                let uri = resource["uri"] as? String ?? ""
+                if mime.hasPrefix("image/") {
+                    images.append("data:\(mime);base64,\(blob)")
+                    return "[image: \(uri)]"
+                }
+                return "[binary resource \(uri) (\(mime), \(blob.count * 3 / 4) bytes)]"
             }
-            if let data = item["data"] as? String { return data }
+            if let data = item["data"] as? String {
+                let mime = item["mimeType"] as? String ?? "application/octet-stream"
+                // Base64 in the prompt costs thousands of tokens and tells the model nothing.
+                if item["type"] as? String == "image" {
+                    images.append("data:\(mime);base64,\(data)")
+                    return "[image \(images.count): \(mime)]"
+                }
+                return "[\(item["type"] as? String ?? "binary"): \(mime), \(data.count * 3 / 4) bytes]"
+            }
+            if item["type"] as? String == "resource_link", let uri = item["uri"] as? String {
+                return "[resource: \(item["name"] as? String ?? uri) \(uri)]"
+            }
             return nil
         }.joined(separator: "\n")
-        return ToolExecutionResult(content: content, isError: result["isError"] as? Bool ?? false)
+        return ToolExecutionResult(content: content, isError: result["isError"] as? Bool ?? false,
+                                   imageURIs: images)
     }
 
     func catalog() async -> MCPCatalog {

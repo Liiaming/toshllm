@@ -64,6 +64,28 @@ struct BuiltinToolInfo: Identifiable, Sendable {
 struct ToolExecutionResult: Sendable, Equatable {
     let content: String
     let isError: Bool
+    /// Images a tool returned, as data URIs, sent to vision models instead of as base64 text.
+    var imageURIs: [String] = []
+}
+
+/// Tool output goes back into the prompt verbatim, so one directory listing or web page can
+/// fill the context. The head and the tail are kept because errors usually land at the end.
+enum ToolResultLimit {
+    static let defaultCharacters = 20_000
+
+    static var characters: Int {
+        UserDefaults.standard.object(forKey: SettingsKeys.toolResultLimit) as? Int ?? defaultCharacters
+    }
+
+    static func apply(_ text: String, limit: Int = characters) -> String {
+        guard limit > 0 else { return text }
+        let total = text.count
+        guard total > limit else { return text }
+        let tail = limit / 4
+        return String(text.prefix(limit - tail))
+            + "\n\n[… \(total - limit) of \(total) characters omitted …]\n\n"
+            + String(text.suffix(tail))
+    }
 }
 
 enum ChatToolsError: LocalizedError {

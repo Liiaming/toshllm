@@ -3,6 +3,12 @@
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Improved
+
+- **LLMs: a long tool result no longer fills the context.** The model gets the first 20,000 characters and the end, with a note of what was cut, and the tool card still shows everything. The limit is in the chat settings under Agents, and 0 turns it off. Images returned by MCP tools reach vision models as images instead of base64 text.
+
 ## [0.87.12] - 2026-09-29
 
 ### Improved
