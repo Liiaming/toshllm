@@ -1,0 +1,159 @@
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index cbbb2262d..3f4433b1b 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -117,10 +117,11 @@ struct executor {
+     size_t act_q_row = 0;
+     size_t h_q_row   = 0;
+ 
+     // current job
+     std::vector<miss> misses;
++    std::vector<int>  grp;   // start of each run of misses on one expert, then the end
+     const host_bank * bank = nullptr;
+     const float * act = nullptr;
+     float * out = nullptr;
+     int n_used = 0;
+     bool wide = false;                 // out holds one row per miss instead of one per router position
+@@ -170,10 +171,22 @@ struct executor {
+     std::vector<std::atomic<uint64_t>> routed_by_layer;
+ 
+     static constexpr int rows1 = 16;
+     static constexpr int rows2 = 64;
+ 
++    // misses sorted by expert; a run is capped so a wide batch still spreads over the threads
++    void build_groups() {
++        static constexpr int max_run = 8;
++        grp.clear();
++        for (int i = 0; i < (int) misses.size(); ++i) {
++            if (i == 0 || misses[i].e != misses[i - 1].e || i - grp.back() >= max_run) {
++                grp.push_back(i);
++            }
++        }
++        grp.push_back((int) misses.size());
++    }
++
+     void barrier() {
+         const uint64_t g = barrier_gen.load(std::memory_order_acquire);
+         if (arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == n_threads) {
+             arrived.store(0, std::memory_order_relaxed);
+             barrier_gen.store(g + 1, std::memory_order_release);
+@@ -191,38 +204,43 @@ struct executor {
+         const ggml_tensor * up_t = bank->fused ? bank->gate : bank->up;
+         const size_t up_off = bank->fused ? (size_t) n_ff*bank->gate->nb[1] : 0;
+         const auto * tt_down = ggml_get_type_traits_cpu(bank->down->type);
+ 
+         const int n_miss = (int) misses.size();
++        const int n_grp  = (int) grp.size() - 1;
+         const int c1 = n_ff/rows1;
+         const clk::time_point t1 = clk::now();
+-        for (int c; (c = next1.fetch_add(1, std::memory_order_relaxed)) < n_miss*c1; ) {
+-            const miss & m = misses[c/c1];
++        // each weight row is read once per run of misses on its expert and applied to all of them
++        for (int c; (c = next1.fetch_add(1, std::memory_order_relaxed)) < n_grp*c1; ) {
++            const int i0 = grp[c/c1], i1 = grp[c/c1 + 1];
++            const miss & m = misses[i0];
+             const int r0 = (c % c1)*rows1;
+             const char * g = m.g ? m.g : (const char *) bank->gate->data + (size_t) m.e*bank->gate->nb[2];
+             const char * u = m.u ? m.u : (const char *) up_t->data + (size_t) m.e*up_t->nb[2] + up_off;
+-            const void * a = act_q.data() + (size_t) m.t*act_q_row;
+-            float * hr = h.data() + (size_t) (c/c1)*n_ff;
+             const float * gb = bank->gate_b.empty() ? nullptr : bank->gate_b.data() + (size_t) m.e*n_ff;
+             const float * ub = bank->up_b.empty()   ? nullptr : bank->up_b.data()   + (size_t) m.e*n_ff;
+             const int act = bank->act.load(std::memory_order_relaxed);
+             for (int r = r0; r < r0 + rows1; ++r) {
+-                float sg, su;
+-                tt_gate->vec_dot(n_embd, &sg, 0, g + (size_t) r*bank->gate->nb[1], 0, a, 0, 1);
+-                tt_up  ->vec_dot(n_embd, &su, 0, u + (size_t) r*up_t->nb[1],       0, a, 0, 1);
+-                if (gb) sg += gb[r];
+-                if (ub) su += ub[r];
+-                if (act == 1) {
+-                    // same form as ggml_swiglu_oai
+-                    const float x = std::min(sg, bank->limit);
+-                    const float y = std::clamp(su, -bank->limit, bank->limit);
+-                    hr[r] = x/(1.0f + expf(-bank->alpha*x))*(y + 1.0f);
+-                } else if (act == 2) {
+-                    // the tanh form ggml_geglu uses
+-                    hr[r] = 0.5f*sg*(1.0f + tanhf(0.7978845608f*sg*(1.0f + 0.044715f*sg*sg)))*su;
+-                } else {
+-                    hr[r] = sg/(1.0f + expf(-sg))*su;
++                for (int i = i0; i < i1; ++i) {
++                    const void * a = act_q.data() + (size_t) misses[i].t*act_q_row;
++                    float * hr = h.data() + (size_t) i*n_ff;
++                    float sg, su;
++                    tt_gate->vec_dot(n_embd, &sg, 0, g + (size_t) r*bank->gate->nb[1], 0, a, 0, 1);
++                    tt_up  ->vec_dot(n_embd, &su, 0, u + (size_t) r*up_t->nb[1],       0, a, 0, 1);
++                    if (gb) sg += gb[r];
++                    if (ub) su += ub[r];
++                    if (act == 1) {
++                        // same form as ggml_swiglu_oai
++                        const float x = std::min(sg, bank->limit);
++                        const float y = std::clamp(su, -bank->limit, bank->limit);
++                        hr[r] = x/(1.0f + expf(-bank->alpha*x))*(y + 1.0f);
++                    } else if (act == 2) {
++                        // the tanh form ggml_geglu uses
++                        hr[r] = 0.5f*sg*(1.0f + tanhf(0.7978845608f*sg*(1.0f + 0.044715f*sg*sg)))*su;
++                    } else {
++                        hr[r] = sg/(1.0f + expf(-sg))*su;
++                    }
+                 }
+             }
+         }
+         barrier();
+         if (tid == 0) {
+@@ -234,18 +252,22 @@ struct executor {
+             }
+         }
+         barrier();
+         const clk::time_point t2 = clk::now();
+         const int c2 = n_embd/rows2;
+-        for (int c; (c = next2.fetch_add(1, std::memory_order_relaxed)) < n_miss*c2; ) {
+-            const miss & m = misses[c/c2];
++        for (int c; (c = next2.fetch_add(1, std::memory_order_relaxed)) < n_grp*c2; ) {
++            const int i0 = grp[c/c2], i1 = grp[c/c2 + 1];
+             const int r0 = (c % c2)*rows2;
+-            const char * d = m.d ? m.d : (const char *) bank->down->data + (size_t) m.e*bank->down->nb[2];
+-            const void * hq = h_q.data() + (size_t) (c/c2)*h_q_row;
+-            float * o = out + (wide ? (size_t) (c/c2) : (size_t) m.t*n_used + m.j)*n_embd;
++            const miss & m0 = misses[i0];
++            const char * d = m0.d ? m0.d : (const char *) bank->down->data + (size_t) m0.e*bank->down->nb[2];
+             for (int r = r0; r < r0 + rows2; ++r) {
+-                tt_down->vec_dot(n_ff, o + r, 0, d + (size_t) r*bank->down->nb[1], 0, hq, 0, 1);
++                for (int i = i0; i < i1; ++i) {
++                    const miss & m = misses[i];
++                    const void * hq = h_q.data() + (size_t) i*h_q_row;
++                    float * o = out + (wide ? (size_t) i : (size_t) m.t*n_used + m.j)*n_embd;
++                    tt_down->vec_dot(n_ff, o + r, 0, d + (size_t) r*bank->down->nb[1], 0, hq, 0, 1);
++                }
+             }
+         }
+         barrier();
+         if (tid == 0) {
+             us_p2 += (uint64_t) us_since(t2);
+@@ -342,10 +364,11 @@ struct executor {
+         if ((int) misses.size() > TOSH_DMOE_WIDE_MAX_ROWS) {
+             tosh_dmoe_fail("a wide layer sent more host rows than the stage holds");
+             return false;
+         }
+         std::stable_sort(misses.begin(), misses.end(), [](const miss & a, const miss & b) { return a.e < b.e; });
++        build_groups();
+         int n_exp = 0;
+         for (size_t i = 0; i < misses.size(); ++i) {
+             map[misses[i].t*nu + misses[i].j] = (int32_t) i;
+             n_exp += i == 0 || misses[i].e != misses[i - 1].e;
+         }
+@@ -430,10 +453,15 @@ struct executor {
+                     misses.push_back({ t, j, ids[k] });
+                     tok_used[t] = true;
+                 }
+             }
+         }
++        // a verify window often routes two tokens to one expert: read its rows once for both
++        if (jb.n_tokens > 1) {
++            std::stable_sort(misses.begin(), misses.end(), [](const miss & a, const miss & b) { return a.e < b.e; });
++        }
++        build_groups();
+ 
+         const uint64_t routed = (uint64_t) jb.n_tokens*n_used;
+         n_routed += routed;
+         n_miss   += misses.size();
+         routed_by_layer[il] += routed;
