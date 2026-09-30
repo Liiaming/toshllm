@@ -1,0 +1,22 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index 0addd0d13..e47dd3547 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -800,11 +800,16 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+     };
+ 
+     const tosh_plan_candidate * sel = nullptr;
+     // VRAM kept free after every known allocation, for the desktop and other apps; the plan
+     // already counts weights, KV, compute, prefill slots and the driver margin
+-    const double reserve_auto = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB);
++    // an MTP head adds its own context and buffers after the plan; past the reserve the driver pages
++    // GPU memory into wired RAM, which slows every token and can use up the host
++    const auto & spec_types = params.speculative.types;
++    const bool mtp = std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec_types.end();
++    const double reserve_auto = std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB) +
++                                (mtp ? env_mib("TOSH_AUTO_MTP_RESERVE_MIB", 768.0) : 0.0);
+     const double reserve_pref = env_mib("TOSH_AUTO_RESERVE_MIB", reserve_auto);
+     const double reserves[2] = { reserve_pref, env_mib("TOSH_AUTO_MIN_RESERVE_MIB", std::max(512.0, reserve_pref - 256.0)) };
+     for (double R : reserves) {
+         evaluate(R);
+         const tosh_plan_candidate * f16 = find("full_gpu", kvs[0], 0);

@@ -13,6 +13,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LLMs: Dynamic MoE with an MTP head no longer runs out of video memory during an answer.** The plan now leaves room for the draft head, so the driver stops moving GPU memory into RAM. On a Radeon RX 6700 XT, Qwen3.6-35B-A3B generates code at 46 tokens a second instead of 34.
+
 - **LLMs: agents and editors no longer drop the connection while a long prompt is being read.** The server sends a keep-alive every 30 seconds from the start of the request, not only once the answer begins.
 
 - **LLMs: Dynamic MoE no longer locks so much memory that a Mac with 32 GB freezes and restarts.** It now leaves at least 12 GB, or 35% of the RAM, for macOS and the open apps, and locks its memory a step at a time, stopping if the system reports memory pressure. Qwen3.6-35B-A3B Q4_K_S keeps its speed; larger quantizations of it use the classic expert offload on 32 GB.
