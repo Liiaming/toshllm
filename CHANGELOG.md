@@ -19,6 +19,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LLMs: a server whose engine stops in the middle of a session starts again on its own, once, with the cause in the log.** A second stop within ten minutes leaves it stopped, as before, so a repeating problem stays visible.
+
 - **LLMs: Dynamic MoE with an MTP head no longer runs out of video memory during an answer.** The plan now leaves room for the draft head, so the driver stops moving GPU memory into RAM. On a Radeon RX 6700 XT, Qwen3.6-35B-A3B generates code at 46 tokens a second instead of 34.
 
 - **LLMs: agents and editors no longer drop the connection while a long prompt is being read.** The server sends a keep-alive every 30 seconds from the start of the request, not only once the answer begins.

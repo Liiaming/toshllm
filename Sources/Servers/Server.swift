@@ -1582,6 +1582,8 @@ final class ServerController: ObservableObject {
     /// After a projector load failure, makes the next launch drop `--mmproj`
     /// (text-only). Reset on every fresh `start()`.
     private var retryWithoutMmproj = false
+    /// When the engine last came back on its own after dying mid-session.
+    private var lastCrashRelaunch: Date?
     private var currentPort = 8080
     private var discoveryService: NetService?
     private var discoveryEnabled = false
@@ -1922,6 +1924,7 @@ final class ServerController: ObservableObject {
                     EngineLock.reapStrayEngines()
                 }
                 if case .failed = self.state { return }
+                let wasServing = self.state == .running
                 if proc.terminationStatus == 0 || proc.terminationStatus == 15 {
                     self.state = .stopped
                 } else {
@@ -1944,7 +1947,17 @@ final class ServerController: ObservableObject {
                         return
                     }
                     AppLog.server.error("engine exited with status \(proc.terminationStatus)")
-                    self.state = .failed(Self.diagnose(self.log, exitCode: proc.terminationStatus))
+                    let why = Self.diagnose(self.log, exitCode: proc.terminationStatus)
+                    // One relaunch keeps chats and external clients working after a crash mid-session;
+                    // a second one within ten minutes stays failed so a repeating cause is not hidden.
+                    if wasServing, self.lastCrashRelaunch.map({ Date().timeIntervalSince($0) > 600 }) ?? true {
+                        self.lastCrashRelaunch = Date()
+                        self.consume("\n[ToshLLM] el motor se detuvo (\(why)) — reiniciando / the engine stopped (\(why)) — restarting\n")
+                        self.state = .starting
+                        self.launch(settings)
+                        return
+                    }
+                    self.state = .failed(why)
                 }
             }
         }
