@@ -1767,7 +1767,6 @@ final class ServerController: ObservableObject {
             }
             var planned = settings
             if settings.usesAutoPlan {
-                AutoMemoryPlan.clearFiles(port: settings.port)
                 guard let plan = await AutoMemoryPlan.preview(settings: settings) else {
                     self?.failAutoPlan(nil)
                     return
@@ -1812,12 +1811,7 @@ final class ServerController: ObservableObject {
     /// Dynamic MoE that did not start (its bank could not be locked) relaunches on the next plan.
     private func confirmAutoRuntime(_ settings: ServerSettings) {
         guard settings.usesAutoPlan else { return }
-        var plan = AutoMemoryPlan.readPlan(port: settings.port) ?? autoPlan
-        if let read = plan, !read.matches(kvMode: settings.autoKVMode) {
-            // a plan for another KV type is not this launch's: keep the preview made for it
-            consume("[ToshLLM] the engine's plan file is for KV \(read.kv), not \(settings.autoKVMode); showing this launch's plan\n")
-            plan = autoPlan
-        }
+        let plan = AutoMemoryPlan.readPlan(port: settings.port) ?? autoPlan
         autoPlan = plan
         let runtime = AutoMemoryRuntime.read(port: settings.port)
         autoRuntime = runtime

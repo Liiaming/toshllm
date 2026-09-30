@@ -152,19 +152,6 @@ struct AutoMemoryPlan: Decodable, Equatable {
     static func readPlan(port: Int) -> AutoMemoryPlan? {
         (try? Data(contentsOf: planURL(port: port))).flatMap(decode)
     }
-
-    /// A launch that dies before planning would otherwise leave the previous run's plan to be read back.
-    static func clearFiles(port: Int) {
-        let base = planURL(port: port).path
-        for suffix in ["", ".runtime", ".actual"] {
-            try? FileManager.default.removeItem(atPath: base + suffix)
-        }
-    }
-
-    /// Whether this plan used the KV type the launch asked for; "auto" accepts whatever the engine chose.
-    func matches(kvMode: String) -> Bool {
-        kvMode == "auto" || kv.lowercased() == kvMode.lowercased()
-    }
 }
 
 /// What the engine did once running: whether mixed execution started, its arena, and why not.
