@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Improved
 
+- **LLMs: Dynamic MoE spends less time on the experts it runs on the CPU.** The host part of each layer takes about 6% less, which adds about 1% to generation speed.
+
 - **LLMs: a long tool result no longer fills the context.** The model gets the first 20,000 characters and the end, with a note of what was cut, and the tool card still shows everything. The limit is in the chat settings under Agents, and 0 turns it off. Images returned by MCP tools reach vision models as images instead of base64 text.
 
 ### Fixed

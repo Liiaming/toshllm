@@ -1,0 +1,42 @@
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 920572b23..85d94170e 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -123,16 +123,17 @@ struct executor {
+     const float * act = nullptr;
+     float * out = nullptr;
+     int n_used = 0;
+     bool wide = false;                 // out holds one row per miss instead of one per router position
+ 
+-    std::atomic<int>      next1{0};
+-    std::atomic<int>      next2{0};
+-    std::atomic<uint64_t> gen{0};
+-    std::atomic<int>      arrived{0};
+-    std::atomic<uint64_t> barrier_gen{0};
+-    std::atomic<bool>     stop{false};
++    // one cache line each: every chunk claim would otherwise invalidate the line the barrier spins on
++    alignas(64) std::atomic<int>      next1{0};
++    alignas(64) std::atomic<int>      next2{0};
++    alignas(64) std::atomic<uint64_t> gen{0};
++    alignas(64) std::atomic<int>      arrived{0};
++    alignas(64) std::atomic<uint64_t> barrier_gen{0};
++    alignas(64) std::atomic<bool>     stop{false};
+ 
+     // helpers spin while jobs come every few hundred microseconds (decode) and sleep otherwise
+     std::mutex              work_mutex;
+     std::condition_variable work_cv;
+     std::atomic<int>        sleepers{0};
+@@ -159,11 +160,12 @@ struct executor {
+     int32_t obs_slots[TOSH_DMOE_MAX_TOKENS*256];
+     int     obs_n = 0;
+     std::vector<std::atomic<uint32_t>> hits_by_tick, routed_by_tick;
+ 
+     // stats
+-    std::atomic<uint64_t> n_jobs{0}, n_routed{0}, n_miss{0};
++    alignas(64) std::atomic<uint64_t> n_jobs{0};
++    std::atomic<uint64_t> n_routed{0}, n_miss{0};
+     std::atomic<uint64_t> n_wide{0}, n_wide_miss{0}, n_wide_experts{0}, us_wide{0};
+     std::atomic<uint64_t> us_job{0}, us_quant{0}, us_p1{0}, us_p2{0};
+     std::vector<std::atomic<uint64_t>> miss_by_layer;
+     std::vector<std::atomic<uint64_t>> routed_by_layer;
+ 
