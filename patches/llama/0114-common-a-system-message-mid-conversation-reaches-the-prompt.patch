@@ -1,0 +1,114 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index ed1942e15..bc1115ba1 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1027,10 +1027,24 @@ static void system_message_not_supported(json & messages) {
+             messages.erase(0);
+         }
+     }
+ }
+ 
++// A system message that the template would drop or reject becomes a user message in place.
++// Merging it into the first system message would change the prompt prefix and miss the cache every turn.
++static void late_system_message_not_supported(json & messages) {
++    bool started = false;
++    for (auto & message : messages) {
++        const std::string role = message.value("role", "");
++        if (role != "system") {
++            started = true;
++        } else if (started) {
++            message["role"] = "user";
++        }
++    }
++}
++
+ static void requires_non_null_content(json & messages) {
+     GGML_ASSERT(messages.is_array());
+     for (auto & message : messages) {
+         if (message.contains("tool_calls") && !message.contains("content")) {
+             message["content"] = "";
+@@ -1277,10 +1291,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+ 
+     if (!tmpl.original_caps().supports_system_role) {
+         workaround::system_message_not_supported(params.messages);
+     }
+ 
++    if (tmpl.original_caps().supports_system_role && !tmpl.original_caps().supports_late_system) {
++        workaround::late_system_message_not_supported(params.messages);
++    }
++
+     if (tmpl.original_caps().supports_tool_calls) {
+         // some templates will require the content field in tool call messages
+         // to still be non-null, this puts an empty string everywhere where the
+         // content field is null
+         workaround::requires_non_null_content(params.messages);
+diff --git a/common/jinja/caps.cpp b/common/jinja/caps.cpp
+index c5962ab77..5a2f438c6 100644
+--- a/common/jinja/caps.cpp
++++ b/common/jinja/caps.cpp
+@@ -90,10 +90,11 @@ std::map<std::string, bool> caps::to_map() const {
+         {"supports_typed_content", supports_typed_content},
+         {"supports_tools", supports_tools},
+         {"supports_tool_calls", supports_tool_calls},
+         {"supports_parallel_tool_calls", supports_parallel_tool_calls},
+         {"supports_system_role", supports_system_role},
++        {"supports_late_system", supports_late_system},
+         {"supports_preserve_reasoning", supports_preserve_reasoning},
+         {"supports_reasoning_effort", supports_reasoning_effort},
+         {"supports_object_arguments", supports_object_arguments},
+     };
+ }
+@@ -210,10 +211,36 @@ caps caps_get(jinja::program & prog) {
+                 result.supports_system_role = false;
+             }
+         }
+     );
+ 
++    JJ_DEBUG("%s\n", ">>> Running capability check: late system message");
++
++    // case: a system message in the middle of the conversation, as agent hooks send
++    if (result.supports_system_role) {
++        static const std::string late_marker = "LATE_SYSTEM_MARKER";
++        caps_try_execute(
++            prog,
++            [&]() {
++                return json::array({
++                    {{"role", "system"},    {"content", "System message"}},
++                    {{"role", "user"},      {"content", "User message"}},
++                    {{"role", "assistant"}, {"content", "Assistant message"}},
++                    {{"role", "system"},    {"content", late_marker}},
++                    {{"role", "user"},      {"content", "User message"}},
++                });
++            },
++            nullptr, // ctx_fn
++            nullptr, // tools_fn
++            [&](context &, bool success, value &, value &, const std::string & rendered) {
++                if (!success || rendered.find(late_marker) == std::string::npos) {
++                    result.supports_late_system = false;
++                }
++            }
++        );
++    }
++
+     JJ_DEBUG("%s\n", ">>> Running capability check: single tool with object arguments support");
+ 
+     // case: tools support: single call with object arguments
+     caps_try_execute(
+         prog,
+diff --git a/common/jinja/caps.h b/common/jinja/caps.h
+index b81dd95f2..a611042bf 100644
+--- a/common/jinja/caps.h
++++ b/common/jinja/caps.h
+@@ -9,10 +9,12 @@ namespace jinja {
+ 
+ struct caps {
+     bool supports_tools = true;
+     bool supports_tool_calls = true;
+     bool supports_system_role = true;
++    // a system message after the conversation started reaches the prompt (some templates drop or reject it)
++    bool supports_late_system = true;
+     bool supports_parallel_tool_calls = true;
+ 
+     // supports preserve reasoning trace in the full history, not just the last assistant message
+     bool supports_preserve_reasoning = false;
+ 

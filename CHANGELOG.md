@@ -9,6 +9,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **LLMs: a long tool result no longer fills the context.** The model gets the first 20,000 characters and the end, with a note of what was cut, and the tool card still shows everything. The limit is in the chat settings under Agents, and 0 turns it off. Images returned by MCP tools reach vision models as images instead of base64 text.
 
+### Fixed
+
+- **LLMs: a system message sent in the middle of a conversation reaches the model.** Agent hooks send them, and templates such as Qwen 3.5's dropped them without a word; they now arrive as a user message in the same place.
+
 ## [0.87.12] - 2026-09-29
 
 ### Improved
