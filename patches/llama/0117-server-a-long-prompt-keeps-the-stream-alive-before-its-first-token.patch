@@ -1,0 +1,56 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 274af9b05..c1562861a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4379,30 +4379,46 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         }
+     } else {
+         // in streaming mode, the first error must be treated as non-stream response
+         // this is to match the OAI API behavior
+         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+-        auto first_result = rd.next(req.should_stop);
+-        if (first_result == nullptr) {
++        // a long prompt sends nothing until its first token and clients drop the connection: past
++        // the ping interval the stream opens with a ping, and a later error arrives inside it
++        bool first_timeout = false;
++        const int64_t first_wait = ggml_time_ms();
++        auto first_result = rd.next([&]() {
++            if (req.should_stop()) {
++                return true;
++            }
++            if (sse_ping_interval > 0 && ggml_time_ms() - first_wait > (int64_t) sse_ping_interval * 1000) {
++                first_timeout = true;
++                return true;
++            }
++            return false;
++        });
++        if (first_result == nullptr && !first_timeout) {
+             GGML_ASSERT(req.should_stop());
+             return res; // connection is closed
+         }
+ 
+-        if (first_result->is_error()) {
++        if (first_result != nullptr && first_result->is_error()) {
+             res->error(first_result->to_json());
+             return res;
+         }
+ 
+         GGML_ASSERT(
++            first_result == nullptr ||
+             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+         );
+ 
+         // next responses are streamed
+         // to be sent immediately
+-        json first_result_json = first_result->to_json();
+-        if (first_result_json == nullptr) {
++        json first_result_json = first_result != nullptr ? first_result->to_json() : json();
++        if (first_result == nullptr) {
++            res->data = ":\n\n";
++        } else if (first_result_json == nullptr) {
+             res->data = ""; // simply send HTTP headers and status code
+         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+             res->data = format_anthropic_sse(first_result_json);
+         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+             res->data = format_oai_resp_sse(first_result_json);

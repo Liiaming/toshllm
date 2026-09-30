@@ -13,6 +13,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LLMs: agents and editors no longer drop the connection while a long prompt is being read.** The server sends a keep-alive every 30 seconds from the start of the request, not only once the answer begins.
+
 - **LLMs: Dynamic MoE no longer locks so much memory that a Mac with 32 GB freezes and restarts.** It now leaves at least 12 GB, or 35% of the RAM, for macOS and the open apps, and locks its memory a step at a time, stopping if the system reports memory pressure. Qwen3.6-35B-A3B Q4_K_S keeps its speed; larger quantizations of it use the classic expert offload on 32 GB.
 
 - **LLMs: a system message sent in the middle of a conversation reaches the model.** Agent hooks send them, and templates such as Qwen 3.5's dropped them without a word; they now arrive as a user message in the same place.
