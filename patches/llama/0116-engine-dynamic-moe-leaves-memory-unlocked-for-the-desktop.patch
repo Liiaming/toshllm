@@ -1,0 +1,180 @@
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index 8f0730faa..0addd0d13 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -655,11 +655,14 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         p.host_pressure = hi.pressure_level >= 4 ? "CRITICAL" : hi.pressure_level >= 2 || hi.swap_growing ? "ELEVATED" : "NORMAL";
+         p.static_reserve_mib = env_mib("TOSH_AUTO_HOST_RESERVE_MIB", std::max(6144.0, 0.20*hi.ram_mib));
+         p.headroom_mib   = env_mib("TOSH_AUTO_HOST_HEADROOM_MIB", std::clamp(0.15*hi.ram_mib, 4096.0, 12288.0));
+         p.static_cap_mib = std::max(0.0, hi.ram_mib - p.static_reserve_mib - hi.self_rss_mib);
+         p.dynamic_cap_mib = std::max(0.0, hi.reclaimable_mib - p.headroom_mib);
+-        p.lockable_mib   = std::max(0.0, hi.wire_limit_mib - hi.wired_mib - 1024.0);
++        // the wire limit alone lets a 32 GB Mac lock 25 GB, and the desktop then has too little
++        // pageable memory left to run: keep a floor unwired
++        const double unwired_mib = env_mib("TOSH_AUTO_HOST_UNWIRED_MIB", std::max(12288.0, 0.35*hi.ram_mib));
++        p.lockable_mib   = std::max(0.0, std::min(hi.wire_limit_mib - hi.wired_mib - 1024.0, hi.ram_mib - hi.wired_mib - unwired_mib));
+         p.effective_mib  = std::min(p.static_cap_mib, p.dynamic_cap_mib);
+         p.full_host_code = p.host_pressure != "NORMAL"           ? "HOST_MEMORY_PRESSURE_HIGH" :
+                            host_dmoe > p.static_cap_mib           ? "FULL_HOST_STATIC_LIMIT" :
+                            host_dmoe > p.dynamic_cap_mib          ? "FULL_HOST_CURRENT_RAM_LIMIT" :
+                            mi.bank_mib + p.host_weights_mib > p.lockable_mib ? "FULL_HOST_WIRE_LIMIT" : "FULL_HOST_SAFE";
+@@ -671,11 +674,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         } else if (p.host_pressure == "CRITICAL") {
+             p.bounded_code = "HOST_MEMORY_PRESSURE_HIGH";
+         } else {
+             // under elevated pressure the cache takes half of what is left
+             const double budget = p.effective_mib*(p.host_pressure == "ELEVATED" ? 0.5 : 1.0) - host_engine - staging_mib;
+-            bounded_warm = std::min({ mi.bank_mib, budget, p.lockable_mib });
++            // the weights kept in RAM and the staging are locked too
++            bounded_warm = std::min({ mi.bank_mib, budget, p.lockable_mib - host_engine - staging_mib });
+             p.bounded_code = bounded_warm >= mi.warm_floor_mib ? "BOUNDED_HOST_SELECTED" :
+                              p.lockable_mib < mi.warm_floor_mib ? "HOST_MEMORY_LOCK_LIMIT" :
+                              bounded_warm > 0 ? "STRUCTURAL_WARM_TOO_SMALL" : "BOUNDED_HOST_CURRENT_RAM_TOO_LOW";
+             // the cache refuses to start below one layer's experts per size, a prefill chunk can pin them all
+             if (bounded_warm < mi.warm_floor_mib) {
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 85d94170e..cbbb2262d 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -1452,14 +1452,15 @@ static void dmoe_lock_bank(const std::vector<llama_layer> & layers) {
+     for (const llama_layer & L : layers) {
+         for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
+             if (t == nullptr || t->data == nullptr) continue;
+             const uintptr_t a = (uintptr_t) t->data & ~(uintptr_t) (page - 1);
+             const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t) + page - 1) & ~(uintptr_t) (page - 1);
+-            if (test_fail || mlock((void *) a, b - a) != 0) {
+-                const int e = test_fail ? EAGAIN : errno;
+-                throw std::runtime_error(format("DMOE_HOST_BANK_NOT_LOCKABLE: mlock of %.0f MiB of the expert bank failed after %.0f MiB (%s)",
+-                                                (b - a)/1048576.0, bytes/1048576.0, strerror(e)));
++            char err[256];
++            if (test_fail || !tosh_mlock_paced((void *) a, b - a, err, sizeof(err))) {
++                throw std::runtime_error(test_fail ? format("DMOE_HOST_BANK_NOT_LOCKABLE: mlock of %.0f MiB of the expert bank failed after %.0f MiB (%s)",
++                                                           (b - a)/1048576.0, bytes/1048576.0, strerror(EAGAIN))
++                                                   : format("%s, expert bank at %.0f MiB", err, bytes/1048576.0));
+             }
+             bytes += b - a;
+         }
+     }
+     locked = true;
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index b7e64a355..054c2df64 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -18,10 +18,13 @@
+ #include <fcntl.h>
+ #include <pthread.h>
+ #include <sys/mman.h>
+ #include <sys/uio.h>
+ #include <sys/param.h>
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
+ #include <unistd.h>
+ 
+ namespace {
+ 
+ enum slot_state : uint8_t { EMPTY, LOADING, RESIDENT };
+@@ -145,10 +148,44 @@ cache g;
+ 
+ double now_us() {
+     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+ }
+ 
++// Wired pages cannot be compressed or paged out: locking faster than the system frees memory
++// evicts the code pages of every other process, and a desktop stalls until the watchdog reboots it.
++bool mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
++    static const size_t step    = (size_t) 256 << 20;
++    static const double wait_us = 30e6;
++    char * base = (char *) addr;
++    for (size_t o = 0; o < bytes; o += step) {
++#ifdef __APPLE__
++        const double t0 = now_us();
++        for (;;) {
++            int lvl = 1; size_t len = sizeof(lvl);
++            if (sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &len, nullptr, 0) != 0 || lvl <= 1) {
++                break;
++            }
++            if (lvl >= 4 || now_us() - t0 > wait_us) {
++                snprintf(err, err_len, "DMOE_HOST_MEMORY_PRESSURE: the system reported %s memory pressure after %.0f of %.0f MiB were locked",
++                         lvl >= 4 ? "critical" : "sustained", o/1048576.0, bytes/1048576.0);
++                munlock(base, o);
++                return false;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
++#endif
++        if (getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr || mlock(base + o, std::min(step, bytes - o)) != 0) {
++            const int e = getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr ? EAGAIN : errno;
++            snprintf(err, err_len, "DMOE_HOST_BANK_NOT_LOCKABLE: mlock failed after %.0f of %.0f MiB (%s)",
++                     o/1048576.0, bytes/1048576.0, strerror(e));
++            munlock(base, o);
++            return false;
++        }
++    }
++    return true;
++}
++
+ void reader_main() {
+ #ifdef __APPLE__
+     // the executor's threads run at this class and would otherwise starve the reads they wait on
+     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+ #endif
+@@ -356,19 +393,15 @@ bool tosh_hostcache_start(int n_layer, int n_expert) {
+     // locking zero-fills every page; with the warm-up fill on, the pages are filled with experts from
+     // the file while the lock proceeds, and the server waits for the lock before it is ready
+     const bool overlap = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB") != nullptr;
+     auto lock_pools = [] {
+         for (auto & pl : g.pools) {
+-            const size_t step = (size_t) 256 << 20;
+-            for (size_t o = 0; o < pl.bytes; o += step) {
+-                // TOSH_DMOE_TEST_MLOCK_FAIL: development check of the failure path
+-                if (getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr || mlock(pl.base + o, std::min(step, pl.bytes - o)) != 0) {
+-                    const int e = getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr ? EAGAIN : errno;
+-                    std::lock_guard<std::mutex> lk(g.m);
+-                    if (g.error.empty()) g.error = std::string("DMOE_HOST_BANK_NOT_LOCKABLE: mlock of the expert cache failed: ") + strerror(e);
+-                    return;
+-                }
++            char err[256];
++            if (!mlock_paced(pl.base, pl.bytes, err, sizeof(err))) {
++                std::lock_guard<std::mutex> lk(g.m);
++                if (g.error.empty()) g.error = err;
++                return;
+             }
+         }
+     };
+     lock.unlock();
+     if (overlap) {
+@@ -560,10 +593,14 @@ static void prewarm(int n_io) {
+     fprintf(stderr, "tosh_hostcache: prewarm %zu experts, %.0f MiB from %s in %s order, %llu reads, %.0f ms (%.2f GB/s)\n",
+             slots.size(), bytes/1048576.0, strcmp(src, "seq") == 0 ? "layer order" : "a list", by_offset ? "file" : "list",
+             (unsigned long long) n_reads.load(), g.prewarm_us/1000, bytes/(g.prewarm_us*1e3));
+ }
+ 
++bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
++    return mlock_paced(addr, bytes, err, err_len);
++}
++
+ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
+     const double t0 = now_us();
+     std::unique_lock<std::mutex> lock(g.m);
+     std::vector<int> wait;
+     std::vector<uint8_t> wait_cls;     // 0 own read, 1 another demand, 2 a read-back
+diff --git a/tosh-moe/tosh-hostcache.h b/tosh-moe/tosh-hostcache.h
+index 98d538f04..4c7f74332 100644
+--- a/tosh-moe/tosh-hostcache.h
++++ b/tosh-moe/tosh-hostcache.h
+@@ -32,10 +32,14 @@ void tosh_hostcache_note_fused_tensor(const void * data, size_t nbytes, int fd,
+ // Dynamic MoE init: layer il's part (0 gate, 1 up, 2 down) is the noted tensor at data
+ bool tosh_hostcache_bind(int il, int part, const void * data, size_t part_bytes, int n_expert);
+ // allocates and locks the cache and starts the readers; false with tosh_hostcache_error() set
+ bool tosh_hostcache_start(int n_layer, int n_expert);
+ 
++// locks [addr, addr+bytes) a step at a time, waiting while the system reports memory pressure;
++// false with a message in err (at least 256 bytes) when the lock fails or the pressure stays up
++bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len);
++
+ // pins experts ids[0..n) of layer il, reading the missing ones; false after a read failure
+ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind);
+ const char * tosh_hostcache_part(int il, int e, int part);
+ void tosh_hostcache_release(int il, const int32_t * ids, int n);
+ 
