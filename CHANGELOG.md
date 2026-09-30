@@ -7,7 +7,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Improved
 
-- **LLMs: experts computed on the CPU unpack each block of weights once for all the tokens that use it.** It covers Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS and Q4_0, with the same result bit for bit. With MoE offload, Qwen3.6-35B-A3B reads short prompts 9% faster and generates 1 to 2% faster with its MTP head.
+- **LLMs: experts computed on the CPU unpack each block of weights once for all the tokens that use it.** It covers Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS and Q4_0, with the same result bit for bit. With MoE offload, Qwen3.6-35B-A3B reads short prompts 9% faster and generates 1 to 2% faster with its MTP head. Dynamic MoE uses them too, and its CPU part of each layer takes 4 to 7% less.
 
 - **LLMs: Dynamic MoE leaves the CPU cores to the experts it computes there.** The engine's own CPU threads had little to do and competed with them for the cores. On a Radeon RX 6700 XT with a 6-core Core i5, Qwen3.6-35B-A3B writes prose 12% faster and code 7% faster.
 
