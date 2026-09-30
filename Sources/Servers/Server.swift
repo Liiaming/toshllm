@@ -1598,6 +1598,8 @@ final class ServerController: ObservableObject {
     /// When the engine last came back on its own after dying mid-session.
     private var lastCrashRelaunch: Date?
     private var currentPort = 8080
+    /// The port a running engine answers on, nil while it is not up.
+    var runningPort: Int? { state == .running ? currentPort : nil }
     private var discoveryService: NetService?
     private var discoveryEnabled = false
     private let fileLog = RotatingFileLog(name: "server.log")

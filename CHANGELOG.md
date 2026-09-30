@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **LLMs: a context recall test in Benchmarks.** It hides a code at 10%, 50% and 90% of a 8K, 32K or 128K text and asks the running server for it back, to check that a quantized KV cache or a long context still remembers what it read.
+
 ### Improved
 
 - **LLMs: while a server starts, its status says what it is doing and for how long.** Planning memory, loading weights, reserving RAM for the experts (when the Mac may feel slower) and preparing them, instead of a plain "Starting".
