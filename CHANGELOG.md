@@ -25,6 +25,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LLMs: after changing the KV cache type of a Dynamic MoE server and restarting it, the memory plan shows the new type the first time** ([#111](https://github.com/engeldlgado/toshllm/issues/111)). A plan left from the previous run could be shown instead.
+
 - **LLMs: agents that ask for reasoning effort "minimal", "off" or "max" no longer get an error from models such as Qwen3.8-Flash-Next.** The first ones turn reasoning off and "max" means high.
 
 - **LLMs: a server whose engine stops in the middle of a session starts again on its own, once, with the cause in the log.** A second stop within ten minutes leaves it stopped, as before, so a repeating problem stays visible.

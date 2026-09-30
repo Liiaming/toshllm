@@ -1012,6 +1012,14 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertNil(plan.product)
     }
 
+    func testAPlanForAnotherKVTypeIsNotThisLaunchs() throws {
+        let json = #"{"state": "DMOE_CONTEXT_OPTIMAL", "mode": "dmoe", "reason": "r", "fallback": "", "kv": "q8_0", "n_ctx": 16384, "ubatch": 1024, "ncmoe": 0, "reserve_mib": 975, "arena_mib": 7867, "min_arena_mib": 1210, "projected_private_mib": 11000, "projected_free_mib": 975, "vram_total_mib": 12266, "vram_free_mib": 11960, "host_required_mib": 11200, "host_ram_mib": 32768, "host_available_mib": 26000, "host_reserve_mib": 8192, "bank_mib": 9682, "mlock": "required", "dispersion": "high", "candidates": []}"#
+        let plan = try XCTUnwrap(AutoMemoryPlan.decode(Data(json.utf8)))
+        XCTAssertTrue(plan.matches(kvMode: "q8_0"))
+        XCTAssertTrue(plan.matches(kvMode: "auto"))
+        XCTAssertFalse(plan.matches(kvMode: "turbo4"), "a Turbo4 launch must not show a Q8 plan left from the previous run")
+    }
+
     func testBenchmarkOutputNamesTheExpertOverride() {
         let header = "| model | ot                    |         lm |            test |"
         let row = "| qwen35moe | " + ServerSettings.expertsOnHostOverride + " |      mlock |           pp512 |"
