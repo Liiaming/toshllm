@@ -1,24 +1,8 @@
 diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
-index 8f0730faa..986cf412f 100644
+index 8f0730faa..9859530ed 100644
 --- a/common/tosh-plan.cpp
 +++ b/common/tosh-plan.cpp
-@@ -655,11 +655,14 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
-         p.host_pressure = hi.pressure_level >= 4 ? "CRITICAL" : hi.pressure_level >= 2 || hi.swap_growing ? "ELEVATED" : "NORMAL";
-         p.static_reserve_mib = env_mib("TOSH_AUTO_HOST_RESERVE_MIB", std::max(6144.0, 0.20*hi.ram_mib));
-         p.headroom_mib   = env_mib("TOSH_AUTO_HOST_HEADROOM_MIB", std::clamp(0.15*hi.ram_mib, 4096.0, 12288.0));
-         p.static_cap_mib = std::max(0.0, hi.ram_mib - p.static_reserve_mib - hi.self_rss_mib);
-         p.dynamic_cap_mib = std::max(0.0, hi.reclaimable_mib - p.headroom_mib);
--        p.lockable_mib   = std::max(0.0, hi.wire_limit_mib - hi.wired_mib - 1024.0);
-+        // the wire limit alone lets a 32 GB Mac lock 25 GB, and the desktop then has too little
-+        // pageable memory left to run: keep a floor unwired
-+        const double unwired_mib = env_mib("TOSH_AUTO_HOST_UNWIRED_MIB", std::max(12288.0, 0.35*hi.ram_mib));
-+        p.lockable_mib   = std::max(0.0, std::min(hi.wire_limit_mib - hi.wired_mib - 1024.0, hi.ram_mib - hi.wired_mib - unwired_mib));
-         p.effective_mib  = std::min(p.static_cap_mib, p.dynamic_cap_mib);
-         p.full_host_code = p.host_pressure != "NORMAL"           ? "HOST_MEMORY_PRESSURE_HIGH" :
-                            host_dmoe > p.static_cap_mib           ? "FULL_HOST_STATIC_LIMIT" :
-                            host_dmoe > p.dynamic_cap_mib          ? "FULL_HOST_CURRENT_RAM_LIMIT" :
-                            mi.bank_mib + p.host_weights_mib > p.lockable_mib ? "FULL_HOST_WIRE_LIMIT" : "FULL_HOST_SAFE";
-@@ -671,11 +674,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+@@ -671,11 +671,12 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
          } else if (p.host_pressure == "CRITICAL") {
              p.bounded_code = "HOST_MEMORY_PRESSURE_HIGH";
          } else {
@@ -32,7 +16,7 @@ index 8f0730faa..986cf412f 100644
                               bounded_warm > 0 ? "STRUCTURAL_WARM_TOO_SMALL" : "BOUNDED_HOST_CURRENT_RAM_TOO_LOW";
              // the cache refuses to start below one layer's experts per size, a prefill chunk can pin them all
              if (bounded_warm < mi.warm_floor_mib) {
-@@ -796,11 +800,16 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+@@ -796,11 +797,16 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
      };
  
      const tosh_plan_candidate * sel = nullptr;
@@ -50,7 +34,7 @@ index 8f0730faa..986cf412f 100644
      for (double R : reserves) {
          evaluate(R);
          const tosh_plan_candidate * f16 = find("full_gpu", kvs[0], 0);
-@@ -1004,10 +1013,20 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+@@ -1004,10 +1010,20 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
          setenv("TOSH_DMOE_MIN_ARENA_MIB", string_format("%.0f", p.min_arena_mib).c_str(), 1);
          setenv("TOSH_DMOE_RARE_ROWS", "auto", 0);
          setenv("TOSH_DMOE_RARE_TAIL", "0", 0);
