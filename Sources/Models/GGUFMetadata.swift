@@ -19,6 +19,18 @@ struct GGUFMetadata: Sendable {
         return value.flatMap(UInt32.init(exactly:))
     }
 
+    fileprivate static let tensorCountKey = "gguf.tensor_count"
+
+    /// Tensors the file holds, from the fixed part of its header.
+    var tensorCount: UInt64? { integerValues[Self.tensorCountKey] }
+
+    /// A file with whole layers in it, against a prediction head packaged alone: the head
+    /// declares the model's layer count too, but holds a few tensors for all of them.
+    var holdsWholeLayers: Bool {
+        guard let tensors = tensorCount, let blocks = uint32(forSuffix: "block_count"), blocks > 0 else { return false }
+        return tensors >= 4 * UInt64(blocks)
+    }
+
     /// Quantization declared by the GGUF header. This is more reliable than
     /// `general.name`, which converters often leave as the base model's BF16 name.
     var fileTypeLabel: String? {
@@ -215,11 +227,11 @@ enum GGUFMetadataCache {
         var cursor = GGUFDataCursor(data: data)
         guard cursor.readBytes(count: 4) == Data([0x47, 0x47, 0x55, 0x46]),
               let version = cursor.readUInt32(), version >= 2,
-              cursor.readUInt64() != nil,
+              let tensorCount = cursor.readUInt64(),
               let metadataCount = cursor.readUInt64(), metadataCount <= 1_000_000 else { return nil }
 
         var strings: [String: String] = [:]
-        var integerValues: [String: UInt64] = [:]
+        var integerValues: [String: UInt64] = [GGUFMetadata.tensorCountKey: tensorCount]
 
         for _ in 0..<metadataCount {
             guard let key = cursor.readString(maxLength: 1 << 20),

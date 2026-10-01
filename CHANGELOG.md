@@ -51,7 +51,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **LLMs: a model that is slow to load gets 10 minutes instead of 5 before its server is stopped.** A large model split across cards could run out of time and stop with nothing in the log.
 
-- **LLMs: a model that carries its own MTP head is no longer taken for the head of the same model without it.** The pair was loaded as model and draft, twice the memory for nothing.
+- **LLMs: a model with its MTP head built in shows up in the model list when its file name says MTP.** Files such as Qwen3.6-35B-A3B-MTP-UD-Q4_K_S were hidden as if they were a head alone, and taken for the head of the same model without it.
 
 - **LLMs: a KV cache type chosen on a stopped server is the one it starts with** ([#111](https://github.com/engeldlgado/toshllm/issues/111)). The server page's Start button used the settings from before the change, so it took a second start to pick it up.
 

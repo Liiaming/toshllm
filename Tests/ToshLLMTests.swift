@@ -1564,6 +1564,32 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(args[args.firstIndex(of: "--spec-type")! + 1], "draft-mtp")
     }
 
+    func testModelNamedMTPWithWholeLayersIsListedAsAModel() throws {
+        func header(tensors: UInt64, blocks: UInt32) -> Data {
+            var d = Data("GGUF".utf8)
+            func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+            func u64(_ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+            func str(_ s: String) { u64(UInt64(s.utf8.count)); d.append(contentsOf: Array(s.utf8)) }
+            u32(3); u64(tensors); u64(2)
+            str("qwen35moe.block_count"); u32(4); u32(blocks)
+            str("qwen35moe.nextn_predict_layers"); u32(4); u32(1)
+            return d
+        }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtp-named-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let model = dir.appendingPathComponent("Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf")
+        let head = dir.appendingPathComponent("Other-9B-MTP-Q8_0.gguf")
+        try header(tensors: 753, blocks: 41).write(to: model)
+        try header(tensors: 32, blocks: 49).write(to: head)
+
+        XCTAssertFalse(GGUFFile.isDraft(model.path), "whole layers: a model with its head built in")
+        XCTAssertTrue(GGUFFile.isDraft(head.path), "a few tensors for 49 layers: a head alone")
+        XCTAssertEqual(LocalModel.scan(in: dir).map(\.name), [model.lastPathComponent])
+        XCTAssertTrue(ServerSettings.modelHasMTP(at: model.path))
+    }
+
     func testModelWithItsOwnMTPHeadIsNotTheHeadOfItsSibling() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("mtp-sibling-\(UUID().uuidString)", isDirectory: true)

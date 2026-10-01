@@ -96,10 +96,15 @@ enum GGUFFile {
     /// cannot be read.
     static func isDraft(_ path: String) -> Bool {
         let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
-        if name.contains("dflash") || name.contains("dspark")
-            || name.hasPrefix("mtp-") || name.hasSuffix(".mtp.gguf")
-            || name.contains("-mtp-") || name.hasSuffix("-mtp.gguf") {
+        if name.contains("dflash") || name.contains("dspark") {
             return true
+        }
+        if name.hasPrefix("mtp-") || name.hasSuffix(".mtp.gguf")
+            || name.contains("-mtp-") || name.hasSuffix("-mtp.gguf") {
+            // the same words name a model that carries its head built in
+            let metadata = GGUFMetadataCache.metadata(at: path)
+            let assistant = metadata?.string(for: "general.architecture")?.hasSuffix("assistant") == true
+            return assistant || metadata?.holdsWholeLayers != true
         }
         // A head packaged under its own name only differs from a model in the header: it
         // borrows the target's embeddings and output instead of carrying its own.
