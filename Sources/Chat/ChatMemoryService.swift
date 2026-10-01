@@ -55,7 +55,7 @@ enum ChatMemoryService {
                 "type": "function",
                 "function": [
                     "name": archiveName,
-                    "description": "Set a range of turns aside so it stops being sent with every request, freeing context. The turns stay in the transcript and can be brought back with memory_recall. Use it when a topic is finished.",
+                    "description": "Set a range of turns aside so it stops being sent with every request. You will no longer see those turns or any file attached to them. Only for when the context is nearly full, and never for a turn the user may still ask about.",
                     "parameters": [
                         "type": "object",
                         "properties": [
@@ -75,7 +75,7 @@ enum ChatMemoryService {
                 "type": "function",
                 "function": [
                     "name": recallName,
-                    "description": "Search the archived parts of this conversation and return the matching turns verbatim. Use it when an earlier topic becomes relevant again.",
+                    "description": "Search the archived parts of this conversation and return the matching turns verbatim. Use it when an earlier topic becomes relevant again; it finds nothing until a range has been archived.",
                     "parameters": [
                         "type": "object",
                         "properties": [
@@ -118,6 +118,16 @@ enum ChatMemoryService {
         let upper = min(to + 1, max(0, messageCount - 2))
         guard lower >= 0, upper > lower, upper <= messageCount else { return nil }
         return (lower, upper)
+    }
+
+    /// Below this share of the context every turn still fits, so nothing is archived.
+    static let archiveMinimumFill = 0.6
+
+    /// Nil when archiving is allowed, otherwise how full the context is, in percent.
+    /// A limit of zero is the model's own context size, unknown here.
+    static func archiveRefusal(used: Int, limit: Int) -> Int? {
+        guard limit > 0, Double(used) / Double(limit) < archiveMinimumFill else { return nil }
+        return used * 100 / limit
     }
 
     static func preview(_ text: String) -> String {

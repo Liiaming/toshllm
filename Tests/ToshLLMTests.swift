@@ -2218,6 +2218,14 @@ final class CompactionTests: XCTestCase {
                      "una conversación de un solo intercambio")
     }
 
+    func testArchiveIsRefusedWhileTheContextHasRoom() {
+        XCTAssertEqual(ChatMemoryService.archiveRefusal(used: 15_700, limit: 32_768), 47,
+                       "un adjunto largo en un contexto a medias no se archiva")
+        XCTAssertNil(ChatMemoryService.archiveRefusal(used: 21_000, limit: 32_768))
+        XCTAssertNil(ChatMemoryService.archiveRefusal(used: 500, limit: 0),
+                     "sin límite conocido no se puede juzgar")
+    }
+
     func testRecallMatchesIgnoringCaseAndAccents() {
         let blocks = [ArchivedBlock(from: 0, to: 3, note: "n")]
         let texts = [0: "Migramos la BASE de datos", 1: "otra cosa", 2: "el índice quedó listo"]

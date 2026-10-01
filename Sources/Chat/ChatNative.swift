@@ -1570,6 +1570,18 @@ final class ChatStore: ObservableObject {
             return ToolExecutionResult(content: "from_index and to_index are required.", isError: true)
         }
         let note = (arguments["note"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let d = UserDefaults.standard
+        let limit = d.object(forKey: SettingsKeys.ctx) == nil ? 16384 : d.integer(forKey: SettingsKeys.ctx)
+        let skipped = ChatMemoryService.archivedIndices(conversations[i].archived)
+        let used = conversations[i].contextUsed
+            ?? conversations[i].messages.enumerated()
+                .filter { $0.offset >= (conversations[i].summarizedCount ?? 0) && !skipped.contains($0.offset) }
+                .reduce(0) { $0 + $1.element.estimatedTokens }
+        if let percent = ChatMemoryService.archiveRefusal(used: used, limit: limit) {
+            return ToolExecutionResult(
+                content: "Not archived: the context is \(percent)% full, so every turn still fits. Answer from the conversation.",
+                isError: true)
+        }
         guard let range = ChatMemoryService.validate(from: from, to: to,
                                                      messageCount: conversations[i].messages.count,
                                                      summarized: conversations[i].summarizedCount ?? 0) else {

@@ -47,6 +47,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LLMs: a chat no longer forgets a file from the first message a few turns later.** With conversation memory on, a model could archive that turn while the context still had room. Archiving now waits until the context is 60% full.
+
 - **LLMs: Dynamic MoE with part of the experts in RAM no longer generates slower after a long prompt.** On a Radeon RX 6700 XT, Qwen3.6-35B-A3B writes prose at 47 tokens a second instead of 37.
 
 - **LLMs: a model that is slow to load gets 10 minutes instead of 5 before its server is stopped.** A large model split across cards could run out of time and stop with nothing in the log.
