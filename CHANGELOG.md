@@ -13,6 +13,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Improved
 
+- **LLMs: long chats with Qwen 3.5 to 3.8 and other hybrid models use less RAM.** Over 14 turns Qwen3.6-35B-A3B grew 1.8 GB instead of 4.1, with the same answers.
+
 - **LLMs: while a server starts, its status says what it is doing and for how long.** Planning memory, loading weights, reserving RAM for the experts (when the Mac may feel slower) and preparing them, instead of a plain "Starting".
 
 - **LLMs: experts computed on the CPU unpack each block of weights once for all the tokens that use it.** It covers Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS and Q4_0, with the same result bit for bit. With MoE offload, Qwen3.6-35B-A3B reads short prompts 9% faster and generates 1 to 2% faster with its MTP head. Dynamic MoE uses them too, and its CPU part of each layer takes 4 to 7% less.
