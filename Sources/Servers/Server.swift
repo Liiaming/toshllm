@@ -1573,7 +1573,7 @@ final class ServerController: ObservableObject {
     }
 
     /// What a starting engine is doing, read from its log, so a long load is not a silent spinner.
-    enum StartupPhase: Equatable { case planning, loadingWeights, lockingMemory, fillingCache }
+    enum StartupPhase: Hashable { case planning, loadingWeights, lockingMemory, fillingCache }
     @Published private(set) var startupPhase: StartupPhase?
     @Published private(set) var startupPhaseSince: Date?
 

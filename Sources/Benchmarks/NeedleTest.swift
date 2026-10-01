@@ -153,15 +153,22 @@ struct NeedleTestCard: View {
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 12) {
                     let fitting = test.lengths(fitting: test.contextTokens)
-                    Picker(loc.t("Hasta", "Up to"), selection: $maxLength) {
-                        ForEach(fitting.isEmpty ? [8192] : fitting, id: \.self) { l in
-                            Text("\(l / 1024)K").tag(l)
+                    if fitting.isEmpty {
+                        Text(server.runningPort == nil
+                             ? loc.t("Inicia el servidor principal con el modelo que quieras probar.", "Start the main server with the model you want to test.")
+                             : loc.t("El contexto del servidor es menor de 8K.", "The server's context is under 8K."))
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        Picker(loc.t("Hasta", "Up to"), selection: $maxLength) {
+                            ForEach(fitting, id: \.self) { l in
+                                Text("\(l / 1024)K").tag(l)
+                            }
                         }
+                        .frame(width: 150)
+                        .disabled(test.running)
+                        .help(loc.t("Longitud máxima del texto. Solo aparecen las que caben en el contexto del servidor; las largas pueden tardar varios minutos cada una.",
+                                    "Longest text to try. Only lengths that fit the server's context are offered; long ones can take several minutes each."))
                     }
-                    .frame(width: 150)
-                    .disabled(test.running || fitting.isEmpty)
-                    .help(loc.t("Longitud máxima del texto. Solo aparecen las que caben en el contexto del servidor; las largas pueden tardar varios minutos cada una.",
-                                "Longest text to try. Only lengths that fit the server's context are offered; long ones can take several minutes each."))
                     Spacer()
                     if test.running {
                         ProgressView().controlSize(.small)

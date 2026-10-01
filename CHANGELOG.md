@@ -33,6 +33,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LLMs: a KV cache type chosen on a stopped server is the one it starts with** ([#111](https://github.com/engeldlgado/toshllm/issues/111)). The server page's Start button used the settings from before the change, so it took a second start to pick it up.
+
 - **LLMs: agents that ask for reasoning effort "minimal", "off" or "max" no longer get an error from models such as Qwen3.8-Flash-Next.** The first ones turn reasoning off and "max" means high.
 
 - **LLMs: a server whose engine stops in the middle of a session starts again on its own, once, with the cause in the log.** A second stop within ten minutes leaves it stopped, as before, so a repeating problem stays visible.

@@ -768,13 +768,10 @@ struct ServerStateBadge: View {
             Label(loc.t("Activo", "Running"), systemImage: "circle.fill")
                 .foregroundStyle(.green).font(.caption)
         case .starting:
-            if let phase, let since {
-                TimelineView(.periodic(from: since, by: 1)) { context in
-                    Label("\(phaseTitle(phase)) · \(Int(context.date.timeIntervalSince(since)))s", systemImage: "circle.fill")
-                        .foregroundStyle(.orange).font(.caption)
-                        .monospacedDigit()
-                }
-                .help(phaseHelp(phase))
+            if let phase {
+                Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
+                    .foregroundStyle(.orange).font(.caption)
+                    .help("\(phase.title(loc)): \(phase.help(loc))")
             } else {
                 Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
                     .foregroundStyle(.orange).font(.caption)
@@ -789,17 +786,30 @@ struct ServerStateBadge: View {
         }
     }
 
-    private func phaseTitle(_ phase: ServerController.StartupPhase) -> String {
-        switch phase {
+}
+
+extension ServerController.StartupPhase {
+    /// Fits under the state in the server header, which must keep its width.
+    func shortTitle(_ loc: Localizer) -> String {
+        switch self {
+        case .planning:       return loc.t("Planificando", "Planning")
+        case .loadingWeights: return loc.t("Cargando pesos", "Loading weights")
+        case .lockingMemory:  return loc.t("Reservando RAM", "Reserving RAM")
+        case .fillingCache:   return loc.t("Preparando", "Preparing")
+        }
+    }
+
+    func title(_ loc: Localizer) -> String {
+        switch self {
         case .planning:       return loc.t("Planificando memoria", "Planning memory")
         case .loadingWeights: return loc.t("Cargando pesos", "Loading weights")
-        case .lockingMemory:  return loc.t("Reservando RAM para expertos", "Reserving RAM for experts")
+        case .lockingMemory:  return loc.t("Reservando RAM", "Reserving RAM")
         case .fillingCache:   return loc.t("Preparando expertos", "Preparing experts")
         }
     }
 
-    private func phaseHelp(_ phase: ServerController.StartupPhase) -> String {
-        switch phase {
+    func help(_ loc: Localizer) -> String {
+        switch self {
         case .planning:
             return loc.t("El motor mide cuánta VRAM y RAM hay libres para decidir cómo repartir el modelo.",
                          "The engine measures free VRAM and RAM to decide how to split the model.")

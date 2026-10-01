@@ -140,7 +140,7 @@ struct ModelFilterBar<Value: Hashable>: View {
 /// A lightweight flow layout for short filter bars. It measures only the
 /// handful of visible chips and wraps complete controls instead of clipping
 /// labels or requiring horizontal scrolling in narrow windows.
-private struct WrappingFilterLayout: Layout {
+struct WrappingFilterLayout: Layout {
     let spacing: CGFloat
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews,

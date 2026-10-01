@@ -147,17 +147,11 @@ private struct ServerDetailHero: View {
         let _ = (globalModelPath, globalNcmoe)
         let settings = server.effectiveSettings()
         let model = ModelName.forPath(settings.modelPath)
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 22) {
-                identity(model, settings: settings)
-                Divider().frame(height: 116)
-                statusAndActions(settings)
-            }
-            VStack(alignment: .leading, spacing: 18) {
-                identity(model, settings: settings)
-                Divider()
-                statusAndActions(settings)
-            }
+        // the identity column wraps, so the status and actions always keep the right side
+        HStack(spacing: 22) {
+            identity(model, settings: settings)
+            Divider().frame(height: 116)
+            statusAndActions(settings)
         }
         .padding(20)
         .cardSurface()
@@ -177,7 +171,7 @@ private struct ServerDetailHero: View {
                 }
                 Text(model.quant.isEmpty ? loc.t("Configura un modelo para esta instancia", "Configure a model for this instance") : model.quant)
                     .font(.system(size: 14, weight: .medium)).foregroundStyle(.secondary)
-                HStack(spacing: 7) {
+                WrappingFilterLayout(spacing: 7) {
                     if let params = model.paramsB { chip(String(format: "%.1fB params", params), "atom") }
                     chip(model.badges.contains("Vision") ? "Vision" : "Text & Chat", "bubble.left")
                     chip(model.family, "cpu")
@@ -199,6 +193,7 @@ private struct ServerDetailHero: View {
     private func chip(_ text: String, _ icon: String) -> some View {
         Label(text, systemImage: icon)
             .font(.system(size: 11, weight: .medium))
+            .lineLimit(1)
             .padding(.horizontal, 8).padding(.vertical, 5)
             .background(WorkspaceStyle.inset, in: Capsule())
             .overlay(Capsule().strokeBorder(WorkspaceStyle.border))
@@ -227,18 +222,11 @@ private struct ServerDetailHero: View {
     }
 
     private func statusAndActions(_ settings: ServerSettings) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .center, spacing: 20) {
-                statusSummary
-                Spacer(minLength: 12)
-                serverActions(settings)
-            }
-            VStack(alignment: .leading, spacing: 14) {
-                statusSummary
-                serverActions(settings)
-            }
+        VStack(alignment: .leading, spacing: 14) {
+            statusSummary
+            serverActions(settings)
         }
-        .frame(minWidth: 410, maxWidth: 520, alignment: .leading)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private var statusSummary: some View {
@@ -246,12 +234,20 @@ private struct ServerDetailHero: View {
             VStack(alignment: .leading, spacing: 3) {
                 ServerStateBadge(state: server.state, phase: server.startupPhase, since: server.startupPhaseSince)
                     .font(.system(size: 15, weight: .semibold))
-                if let started = server.startedAt {
+                if server.state == .starting, let phase = server.startupPhase, let since = server.startupPhaseSince {
+                    TimelineView(.periodic(from: since, by: 1)) { tick in
+                        Text("\(phase.shortTitle(loc)) · \(Int(tick.date.timeIntervalSince(since)))s")
+                            .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    .help("\(phase.title(loc)): \(phase.help(loc))")
+                } else if let started = server.startedAt {
                     Text(loc.t("Activo durante %@", "Uptime %@", duration(from: started, to: context.date)))
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .fixedSize(horizontal: true, vertical: false)
+            .lineLimit(1)
+            // one width for every state, so a state change never switches the header's layout
+            .frame(width: 130, alignment: .leading)
         }
     }
 
@@ -273,18 +269,17 @@ private struct ServerDetailHero: View {
                     Label(loc.t("Detener servidor", "Stop server"), systemImage: "stop.fill")
                 }.glassButton(prominent: true)
             } else {
-                Button { server.start(settings) } label: {
+                // read at the click: `settings` is this view's last render, which a global KV change does not redraw
+                Button { server.start(server.effectiveSettings()) } label: {
                     Label(loc.t("Iniciar servidor", "Start server"), systemImage: "play.fill")
                 }.glassButton(prominent: true)
                     .disabled(settings.routerMode ? models.models.isEmpty : settings.modelPath.isEmpty)
             }
-            if server.state == .running || server.profile != nil {
+            if server.profile != nil {
                 Menu {
-                    if server.profile != nil {
-                        Button(loc.t("Eliminar servidor", "Delete server"), systemImage: "trash", role: .destructive) {
-                            manager.removeServer(server.id)
-                            control.serverAnchor = nil
-                        }
+                    Button(loc.t("Eliminar servidor", "Delete server"), systemImage: "trash", role: .destructive) {
+                        manager.removeServer(server.id)
+                        control.serverAnchor = nil
                     }
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).glassButton()
