@@ -88,12 +88,15 @@ struct AutoMemoryPlan: Decodable, Equatable {
 
     var isUnsupported: Bool { state == "UNSUPPORTED" }
     var usesDynamicMoE: Bool { mode == "dmoe" || mode == "dmoe_bounded" }
+    /// The user asked for RAM to hold only the experts that are not in VRAM.
+    var savesHostRAM: Bool { product?.reason == "HOST_RAM_SAVING" }
 
     var productState: ProductState {
         switch product?.mode ?? "" {
         case "PLAN_FULL_GPU": return .fullGPU
         case "PLAN_FULL_HOST_DMOE": return .fullHost
-        case "PLAN_BOUNDED_DMOE": return product?.dmoe.coverageState == "GOOD" ? .boundedHost : .memoryConstrained
+        // a cache kept small by choice is not a machine short of memory
+        case "PLAN_BOUNDED_DMOE": return product?.dmoe.coverageState == "GOOD" || savesHostRAM ? .boundedHost : .memoryConstrained
         case "PLAN_CLASSIC_NCMOE": return .classicFallback
         case "PLAN_UNSUPPORTED": return .cannotLoad
         default:
@@ -234,8 +237,9 @@ enum AutoMemoryText {
             parts.append(t("\(plan.ncmoe) capas de expertos en CPU", "\(plan.ncmoe) expert layers on CPU"))
         }
         parts.append(t("contexto \(plan.nCtx / 1024)K", "\(plan.nCtx / 1024)K context"))
-        parts.append("KV \(kvLabel(plan.kv))")
+        // a plan that found no configuration chose no cache type either
         if !plan.isUnsupported {
+            parts.append("KV \(kvLabel(plan.kv))")
             parts.append(t("\(gib(plan.projectedFreeMib)) de VRAM libre", "\(gib(plan.projectedFreeMib)) VRAM headroom"))
         }
         return parts.joined(separator: " · ")
@@ -254,6 +258,9 @@ enum AutoMemoryText {
         case "DMOE_CAPACITY_REQUIRED":
             s = t("Dynamic MoE: el modelo no cabe en VRAM; la GPU guarda los expertos más usados.",
                   "Dynamic MoE: the model does not fit in VRAM; the GPU keeps the most used experts.")
+        case "DMOE_BOUNDED_HOST" where plan.savesHostRAM:
+            s = t("Dynamic MoE ahorrando RAM: la RAM guarda solo los expertos que no están en VRAM y el resto se lee del archivo del modelo.",
+                  "Dynamic MoE saving RAM: RAM keeps only the experts that are not in VRAM and the rest are read from the model file.")
         case "DMOE_BOUNDED_HOST":
             s = t("Dynamic MoE con RAM limitada: la memoria libre ahora no da para todo el banco de expertos; la RAM guarda los más usados y el resto se lee del archivo del modelo.",
                   "Dynamic MoE with bounded RAM: free memory right now cannot hold the whole expert bank; RAM keeps the most used experts and the rest are read from the model file.")

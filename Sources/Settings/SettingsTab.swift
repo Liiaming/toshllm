@@ -60,6 +60,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.dynamicMoeEnabled) private var dynamicMoeEnabled = false
     @AppStorage(SettingsKeys.executionMode) private var executionMode = "auto"
     @AppStorage(SettingsKeys.autoKVMode) private var autoKVMode = "auto"
+    @AppStorage(SettingsKeys.dynamicMoeLeanRAM) private var dynamicMoeLeanRAM = false
     @AppStorage(SettingsKeys.modelsDir) private var modelsDir = ""
     @AppStorage(SettingsKeys.menuBarIcon) private var menuBarIcon = true
     @AppStorage(SettingsKeys.updateAutoCheck) private var updateAutoCheck = true
@@ -643,6 +644,10 @@ struct SettingsView: View {
                     .settingsGlyph("key")
                     .infoTip(loc.t("Auto usa F16 y pasa a Q8 solo cuando libera memoria que de verdad importa (Q8 no cambia la calidad de forma medible). Turbo4 ahorra más memoria a cambio de algo de velocidad y calidad; nunca se elige solo.",
                                 "Auto uses F16 and moves to Q8 only when that frees memory that really matters (Q8 has no measurable quality cost). Turbo4 saves more memory at some speed and quality cost; it is never chosen automatically."))
+                    Toggle(loc.t("Ahorrar RAM", "Save RAM"), isOn: $dynamicMoeLeanRAM)
+                        .settingsGlyph("memorychip")
+                        .infoTip(loc.t("Apagado: si caben, todos los expertos se quedan en RAM, también los que ya están en VRAM. Encendido: la RAM guarda solo los que no están en VRAM y deja libre el resto para otras apps; genera más lento (entre un 11 y un 17% en un modelo de 35B) y el primer prompt tras cargar tarda más.",
+                                    "Off: when they fit, every expert stays in RAM, also the ones already in VRAM. On: RAM keeps only the ones that are not in VRAM and leaves the rest free for other apps; generation is slower (11 to 17% on a 35B model) and the first prompt after loading takes longer."))
                 }
             }
 

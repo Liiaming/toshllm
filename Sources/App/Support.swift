@@ -124,6 +124,8 @@ enum SettingsKeys {
     static let executionMode = "executionMode"
     /// auto | f16 | q8_0 | turbo4
     static let autoKVMode = "autoKVMode"
+    /// Dynamic MoE keeps in RAM only the experts that are not in VRAM, even when all of them fit.
+    static let dynamicMoeLeanRAM = "dynamicMoeLeanRAM"
     static let routerMode = "routerMode"
     static let routerModelsMax = "routerModelsMax"
     static let serverConfigurationAdvanced = "serverConfigurationAdvanced"
@@ -258,7 +260,7 @@ enum SettingsKeys {
         memoryToolsEnabled, toolsUnsupportedModels, mcpServers, uiMcpProxy,
         cacheTypeK, cacheTypeV, mlock, cacheRAM,
         parallelSlots, reasoningInline, serverDefaultReasoning, serverDefaultMaxTokens, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
-        dynamicMoeEnabled, routerMode, routerModelsMax,
+        dynamicMoeEnabled, dynamicMoeLeanRAM, routerMode, routerModelsMax,
         persistCache, multiGPU, multiGPUCount, splitMode, splitGroupSize, mgpuEvents, mgpuPeer,
         forcePrivateBuffers, cacheReuse, apiKeyEnabled, localNetworkDiscovery,
         menuBarIcon, menuBarGPU, autoStart, updateAutoCheck, appAccent,

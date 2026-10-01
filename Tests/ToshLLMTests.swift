@@ -980,6 +980,10 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--dynamic-moe")! + 1], "on")
         XCTAssertNil(s.environment["TOSH_AUTO"], "the switch is the flag; TOSH_AUTO stays a developer override")
         XCTAssertEqual(s.environment["TOSH_AUTO_KV"], "auto")
+        XCTAssertNil(s.environment["TOSH_AUTO_HOST_BANK"], "the whole bank stays in RAM unless asked")
+        s.dynamicMoeLeanRAM = true
+        XCTAssertEqual(s.environment["TOSH_AUTO_HOST_BANK"], "lean")
+        s.dynamicMoeLeanRAM = false
         XCTAssertEqual(s.environment["TOSH_AUTO_PLAN_FILE"], AutoMemoryPlan.planURL(port: s.port).path)
         XCTAssertFalse(s.arguments.contains("--n-cpu-moe"), "the plan decides the offload")
         XCTAssertFalse(s.arguments.contains("--ubatch-size"), "the plan decides the batch")
@@ -1521,6 +1525,59 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(URL(fileURLWithPath: args[args.firstIndex(of: "-md")! + 1])
             .resolvingSymlinksInPath().path, canonicalDraft)
         XCTAssertEqual(args[args.firstIndex(of: "--spec-type")! + 1], "draft-mtp")
+    }
+
+    func testModelPublishDateReadsCreationAndBaseModel() {
+        let one = Data(#"{"createdAt": "2025-04-28T14:24:34.000Z", "cardData": {"base_model": "Qwen/Qwen3-8B"}}"#.utf8)
+        let parsed = ModelPublishDate.parse(one)
+        XCTAssertEqual(parsed.base, "Qwen/Qwen3-8B")
+        XCTAssertEqual(parsed.created.map { Calendar(identifier: .gregorian).dateComponents(in: TimeZone(identifier: "UTC")!, from: $0).year }, 2025)
+
+        let list = Data(#"{"createdAt": "2025-04-28T14:24:34Z", "cardData": {"base_model": ["a/b", "c/d"]}}"#.utf8)
+        XCTAssertEqual(ModelPublishDate.parse(list).base, "a/b")
+        XCTAssertNotNil(ModelPublishDate.parse(list).created)
+
+        let bare = Data(#"{"id": "x/y"}"#.utf8)
+        XCTAssertNil(ModelPublishDate.parse(bare).created)
+        XCTAssertNil(ModelPublishDate.parse(bare).base)
+        XCTAssertNil(ModelPublishDate.parse(Data("not json".utf8)).created)
+    }
+
+    func testSeparateMTPHeadIsPassedUnderDynamicMoe() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtp-dmoe-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let base = dir.appendingPathComponent("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+        let head = dir.appendingPathComponent("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf")
+        try writeMinimalMoEGGUF(base)
+        try Data("head".utf8).write(to: head)
+
+        var s = makeSettings()
+        s.modelPath = base.path
+        s.dynamicMoeEnabled = true
+        s.plannedMode = "dmoe"
+        XCTAssertTrue(s.usesAutoPlan)
+        let args = s.arguments
+        XCTAssertEqual(URL(fileURLWithPath: args[args.firstIndex(of: "-md")! + 1]).lastPathComponent,
+                       head.lastPathComponent, "the plan counts a separate head, so it is passed")
+        XCTAssertEqual(args[args.firstIndex(of: "--spec-type")! + 1], "draft-mtp")
+    }
+
+    func testModelWithItsOwnMTPHeadIsNotTheHeadOfItsSibling() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtp-sibling-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let base = dir.appendingPathComponent("Qwen3.6-35B-A3B-UD-Q4_K_S.gguf")
+        let withHead = dir.appendingPathComponent("Qwen3.6-35B-A3B-MTP-UD-Q4_K_S.gguf")
+        try FileManager.default.moveItem(at: makeGGUF(nextnLayers: nil, tensorName: "blk.0.attn_q.weight"), to: base)
+        try FileManager.default.moveItem(at: makeGGUF(nextnLayers: 1, tensorName: "blk.0.nextn.eh_proj.weight"), to: withHead)
+
+        XCTAssertNil(ServerSettings.mtpDraftPath(forModel: base.path), "a whole model is not a head")
+        var s = makeSettings()
+        s.modelPath = base.path
+        XCTAssertFalse(s.arguments.contains("-md"))
     }
 
     func testSeparateMTPAssistantDoesNotPairWithAnotherModel() throws {

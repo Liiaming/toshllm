@@ -9,6 +9,7 @@ struct LocalModelDetailsSheet: View {
     let model: LocalModel
     @EnvironmentObject private var loc: Localizer
     @Environment(\.dismiss) private var dismiss
+    @State private var published: ModelPublishDate?
 
     private var parsed: ModelName { ModelName.forPath(model.url.path) }
     private var metadata: GGUFMetadata? { GGUFMetadataCache.metadata(at: model.url.path) }
@@ -30,6 +31,10 @@ struct LocalModelDetailsSheet: View {
         }
         .frame(width: 620, height: 590)
         .background(WorkspaceStyle.canvas)
+        .task(id: source?.repository) {
+            guard let repository = source?.repository else { return }
+            published = await ModelPublishDate.fetch(repository: repository)
+        }
     }
 
     private var header: some View {
@@ -86,6 +91,13 @@ struct LocalModelDetailsSheet: View {
                 }
                 if let revision = source.revision {
                     detailRow(loc.t("Revisión", "Revision"), revision)
+                }
+                if let published {
+                    detailRow(loc.t("Publicado", "Published"),
+                              published.date.formatted(date: .abbreviated, time: .omitted)
+                              + (published.repository == source.repository ? "" : " · \(published.repository)"))
+                        .help(loc.t("Cuándo se publicó el modelo en Hugging Face; si este archivo es una cuantización, la fecha es la del modelo original. Lo que sabe suele terminar unos meses antes.",
+                                    "When the model was published on Hugging Face; if this file is a quantization, the date is the original model's. What it knows usually ends a few months earlier."))
                 }
                 detailRow(loc.t("Archivo de origen", "Source file"), source.fileName)
                 VStack(alignment: .leading, spacing: 6) {
