@@ -21,6 +21,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **LLMs: Dynamic MoE leaves the CPU cores to the experts it computes there.** The engine's own CPU threads had little to do and competed with them for the cores. On a Radeon RX 6700 XT with a 6-core Core i5, Qwen3.6-35B-A3B writes prose 12% faster and code 7% faster.
 
+- **LLMs: Dynamic MoE starts answering short messages sooner.** On a Radeon RX 6700 XT, Qwen3.6-35B-A3B reads a 30-token follow-up in 0.4 s instead of 0.9, and on a Radeon Pro Vega II, Qwen3.8-Flash-Next in 1.0 s instead of 2.6.
+
 - **LLMs: models with an MTP head also draft from earlier text when the answer repeats it.** When a rewrite or an edit copies stretches of the prompt, a longer guess taken from that text is verified instead, only where the measured timing says it pays. On a Radeon RX 6700 XT, Qwen3.8-9B edits a file 12% faster; prose and new code keep their speed.
 
 - **LLMs: Q2_0 and PQ2_0 models, such as the GSQ-RCO quantizations and Ternary Bonsai, compute on the CPU about 9 times faster on Intel Macs with AVX2, and PTQ1_0 models 1.4 times.** This covers experts left on the CPU and Macs without a supported GPU.
