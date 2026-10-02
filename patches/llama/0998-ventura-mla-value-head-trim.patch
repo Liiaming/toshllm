@@ -1,0 +1,21 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2772,7 +2772,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         }
+ 
+         const int64_t orig_head_v = hparams.n_embd_head_v(il);
+-        if (orig_head_v != cur->ne[0]) {
++        if (!v_mla && orig_head_v != cur->ne[0]) {
+             cur = ggml_view_4d(ctx0, cur, orig_head_v, cur->ne[1], cur->ne[2], cur->ne[3], cur->nb[1], cur->nb[2], cur->nb[3], 0);
+             cur = ggml_cont(ctx0, cur);
+         }
+@@ -2840,7 +2840,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         }
+ 
+         const int64_t orig_head_v = hparams.n_embd_head_v(il);
+-        if (orig_head_v != kqv->ne[0]) {
++        if (!v_mla && orig_head_v != kqv->ne[0]) {
+             kqv = ggml_view_4d(ctx0, kqv, orig_head_v, kqv->ne[1], kqv->ne[2], kqv->ne[3], kqv->nb[1], kqv->nb[2], kqv->nb[3], 0);
+             kqv = ggml_cont(ctx0, kqv);
+         }
