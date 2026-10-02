@@ -2,7 +2,7 @@ diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
 index 0209b96f1..6b154a1d2 100644
 --- a/src/llama-tosh-dmoe.cpp
 +++ b/src/llama-tosh-dmoe.cpp
-@@ -226,8 +226,28 @@ void tosh_dmoe_timeline(int kind, int il, double t0, double t1) {
+@@ -226,7 +226,30 @@ void tosh_dmoe_timeline(int kind, int il, double t0, double t1) {
  
  static size_t g_vram_free = 0, g_vram_total = 0;
  void tosh_dmoe_set_vram(size_t free_at_start, size_t total) {
