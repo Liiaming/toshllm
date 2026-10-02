@@ -1,0 +1,94 @@
+name: Ventura x86_64 engine
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ventura-x86_64-engine]
+    paths:
+      - ".github/workflows/ventura-engine.yml"
+      - "patches/llama/**"
+      - "scripts/build-engines.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build patched llama.cpp for macOS 13 x86_64
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Retarget engine build to Ventura
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Keep the fork's main branch untouched: only patch the checked-out CI workspace.
+          sed -i '' 's/DEPLOYMENT_TARGET="14.0"/DEPLOYMENT_TARGET="13.0"/' scripts/build-engines.sh
+          sed -i '' 's/-mmacosx-version-min=14.0 -std=metal3.1/-mmacosx-version-min=13.0 -std=metal3.0/g' scripts/build-engines.sh
+          grep -n 'DEPLOYMENT_TARGET\|mmacosx-version-min' scripts/build-engines.sh
+
+      - name: Build only llama.cpp engine
+        shell: bash
+        env:
+          SKIP_WHISPER: "1"
+          SKIP_IMAGE: "1"
+        run: |
+          set -euxo pipefail
+          ARCH=x86_64 ./scripts/build-engines.sh
+
+      - name: Validate binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN=vendor/llama.cpp/build-static/bin
+          test -x "$BIN/llama-server"
+          test -x "$BIN/llama-bench"
+
+          file "$BIN/llama-server"
+          file "$BIN/llama-bench"
+
+          file "$BIN/llama-server" | grep -q 'x86_64'
+          file "$BIN/llama-bench" | grep -q 'x86_64'
+
+          echo "---- llama-server deployment target ----"
+          otool -l "$BIN/llama-server" | awk '
+            /LC_BUILD_VERSION/ { in_build=1; next }
+            in_build && /minos/ { print; found=1; exit }
+            END { if (!found) exit 1 }
+          ' | tee /tmp/minos.txt
+          grep -q '13\.' /tmp/minos.txt
+
+          echo "---- linked frameworks ----"
+          otool -L "$BIN/llama-server"
+
+          echo "---- Metal artifacts ----"
+          find "$BIN" -maxdepth 2 -type f \( -name '*.metallib' -o -name 'llama-server' -o -name 'llama-bench' \) -print
+
+          "$BIN/llama-server" --version
+          "$BIN/llama-bench" --version || true
+
+      - name: Package Ventura engine
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifact
+          BIN=vendor/llama.cpp/build-static/bin
+          cp "$BIN/llama-server" artifact/
+          cp "$BIN/llama-bench" artifact/
+          [ -f "$BIN/default.metallib" ] && cp "$BIN/default.metallib" artifact/ || true
+          [ -d "$BIN/kernels" ] && cp -R "$BIN/kernels" artifact/ || true
+          shasum -a 256 artifact/* 2>/dev/null | tee artifact/SHA256SUMS.txt || true
+          tar -czf toshllm-ventura-x86_64-engine.tar.gz -C artifact .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: toshllm-ventura-x86_64-engine
+          path: toshllm-ventura-x86_64-engine.tar.gz
+          if-no-files-found: error
