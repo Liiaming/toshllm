@@ -1,0 +1,36 @@
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 0209b96f1..6b154a1d2 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -226,8 +226,28 @@ void tosh_dmoe_timeline(int kind, int il, double t0, double t1) {
+ 
+ static size_t g_vram_free = 0, g_vram_total = 0;
+ void tosh_dmoe_set_vram(size_t free_at_start, size_t total) {
+-    if (g_vram_total == 0) { g_vram_free = free_at_start; g_vram_total = total; }
++    if (g_vram_total != 0) {
++        return;
++    }
++
++    // Ventura's pre-RDNA AMD PerformanceStatistics can publish a transient
++    // free+used total well below the card's physical VRAM.  Keep the driver's
++    // already-in-use baseline, but allow an explicit physical-total override.
++    // This is opt-in: without the variable the upstream accounting is unchanged.
++    if (const char * v = getenv("TOSH_DMOE_VRAM_TOTAL_MIB")) {
++        const double mib = atof(v);
++        if (mib > 0.0) {
++            const size_t override_total = (size_t) (mib*1048576.0);
++            const size_t used = total > free_at_start ? total - free_at_start : 0;
++            const size_t override_free = override_total > used ? override_total - used : 0;
++            fprintf(stderr,
++                    "tosh_dmoe: VRAM total override %.0f MiB -> %.0f MiB; preserving %.0f MiB already in use, free at start %.0f MiB\n",
++                    total/1048576.0, override_total/1048576.0, used/1048576.0, override_free/1048576.0);
++            total = override_total;
++            free_at_start = override_free;
++        }
++    }
++
++    g_vram_free = free_at_start;
++    g_vram_total = total;
+ }
+ static size_t (*g_private_query)(void) = nullptr;
+ void   tosh_dmoe_set_private_query(size_t (*fn)(void)) { g_private_query = fn; }
